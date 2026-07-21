@@ -23,6 +23,7 @@ MATERIAL_BINDINGS = MATERIAL_INPUTS
 SCENE_FORMAT = "rgba16float"
 SHADOW_FORMAT = "depth32float"
 SHADOW_SIZE = 1536
+AUTO_WIREFRAME_TRIANGLE_LIMIT = 250_000
 
 
 @dataclass(slots=True)
@@ -73,6 +74,24 @@ class _MaterialTextureSet:
         for texture in self.textures.values():
             texture.release()
         self.textures.clear()
+
+
+@dataclass(slots=True)
+class _GeometryBufferSet:
+    vertex_buffer: Any
+    index_buffer: Any
+    bytes_used: int
+
+    def release(self) -> None:
+        for buffer in (self.vertex_buffer, self.index_buffer):
+            destroy = getattr(buffer, "destroy", None)
+            if callable(destroy):
+                try:
+                    destroy()
+                except Exception:
+                    pass
+        self.vertex_buffer = None
+        self.index_buffer = None
 
 
 def _normalise(value: np.ndarray) -> np.ndarray:
@@ -195,6 +214,11 @@ class ThreeDRenderer:
         self._active_material_cache_key: str | None = None
         self._active_channel_tokens: dict[str, str] = {}
         self._material_texture_cache: MemoryLRU[_MaterialTextureSet] = MemoryLRU(512 * 1024 * 1024)
+        # Procedural graph meshes can be much more expensive to build and upload
+        # than their material maps. Keep recent vertex/index buffer pairs resident
+        # and address them by the stable CPU geometry cache key.
+        self._geometry_buffer_cache: MemoryLRU[_GeometryBufferSet] = MemoryLRU(256 * 1024 * 1024)
+        self._active_geometry_cache_key: str | None = None
         self._environment: _TextureHandle | None = None
         self._environment_name = ""
         self._bind_group = None
@@ -735,13 +759,40 @@ class ThreeDRenderer:
         return True
 
     def set_material_cache_budget_mb(self, budget_mb: int) -> None:
+        budget_mb = max(int(budget_mb), 32)
         self._material_texture_cache.set_budget(
-            max(int(budget_mb), 32) * 1024 * 1024,
+            budget_mb * 1024 * 1024,
             protected_key=self._active_material_cache_key,
         )
+        # Geometry gets a substantial but bounded share of the renderer budget.
+        # One current mesh larger than the budget remains protected by MemoryLRU.
+        geometry_cache = getattr(self, "_geometry_buffer_cache", None)
+        if geometry_cache is not None:
+            geometry_cache.set_budget(
+                max(budget_mb // 2, 128) * 1024 * 1024,
+                protected_key=getattr(self, "_active_geometry_cache_key", None),
+            )
 
     def material_cache_stats(self) -> CacheStats:
         return self._material_texture_cache.stats()
+
+    def geometry_cache_stats(self) -> CacheStats:
+        return self._geometry_buffer_cache.stats()
+
+    def clear_geometry_cache(self) -> None:
+        with self._lock:
+            # Detach the displayed buffers before clearing the LRU so a manual
+            # cache clear cannot invalidate the currently visible mesh mid-frame.
+            active = (
+                self._geometry_buffer_cache.take(self._active_geometry_cache_key)
+                if self._active_geometry_cache_key is not None
+                else None
+            )
+            self._geometry_buffer_cache.clear()
+            if active is not None:
+                self._vertex_buffer = active.vertex_buffer
+                self._index_buffer = active.index_buffer
+            self._active_geometry_cache_key = None
 
     def clear_material_cache(self) -> None:
         with self._lock:
@@ -801,15 +852,31 @@ class ThreeDRenderer:
             self.error = ""
         self.request_draw()
 
+    @staticmethod
+    def _geometry_identity(mesh: MeshData | None) -> tuple[str, object] | None:
+        if mesh is None:
+            return None
+        stable_key = str(getattr(mesh, "cache_key", "") or "")
+        return ("cache", stable_key) if stable_key else ("object", id(mesh))
+
     def set_geometry_override(self, mesh: MeshData | None, *, inspection: bool = False) -> None:
-        """Temporarily replace the viewport primitive with graph geometry."""
+        """Temporarily replace the viewport primitive with graph geometry.
+
+        A persistent geometry result may be wrapped more than once by callers,
+        so renderer identity is based on its stable cache key rather than Python
+        object identity alone. Unrelated Material edits therefore do not invalidate
+        or re-upload an unchanged procedural mesh.
+        """
         with self._lock:
             inspection = bool(inspection and mesh is not None)
             if mesh is None and self._geometry_override is None and not self._geometry_inspection:
                 return
-            if mesh is self._geometry_override and inspection == self._geometry_inspection:
+            previous_identity = self._geometry_identity(self._geometry_override)
+            next_identity = self._geometry_identity(mesh)
+            if next_identity == previous_identity and inspection == self._geometry_inspection:
+                self._geometry_override = mesh
                 return
-            mesh_changed = mesh is not self._geometry_override
+            mesh_changed = next_identity != previous_identity
             self._geometry_override = mesh
             self._geometry_inspection = inspection
             if mesh_changed:
@@ -828,7 +895,17 @@ class ThreeDRenderer:
 
     def wireframe_enabled(self) -> bool:
         mode = str(self.settings.get("wireframe", "Auto"))
-        return mode == "Always" or (mode == "Auto" and self._geometry_inspection)
+        if mode == "Always":
+            return True
+        if mode != "Auto" or not self._geometry_inspection:
+            return False
+        # Building a unique edge list can cost more than drawing the dense mesh
+        # itself. Auto mode therefore yields to interactivity for very large
+        # procedural meshes; artists can still explicitly select Always.
+        return bool(
+            self._mesh is None
+            or self._mesh.triangle_count <= AUTO_WIREFRAME_TRIANGLE_LIMIT
+        )
 
     @staticmethod
     def _wire_indices(indices: np.ndarray) -> np.ndarray:
@@ -963,13 +1040,69 @@ class ThreeDRenderer:
         self._pivot_pipelines[key] = pipeline
         return pipeline
 
+    @staticmethod
+    def _destroy_buffer(buffer: Any) -> None:
+        destroy = getattr(buffer, "destroy", None)
+        if callable(destroy):
+            try:
+                destroy()
+            except Exception:
+                pass
+
+    def _release_transient_mesh_buffers(self) -> None:
+        # Cached graph buffers are owned by _geometry_buffer_cache. Built-in and
+        # detached active buffers are renderer-owned transients.
+        if self._active_geometry_cache_key is not None:
+            return
+        self._destroy_buffer(self._vertex_buffer)
+        self._destroy_buffer(self._index_buffer)
+
+    def _activate_geometry_buffers(self, cache_key: str, mesh: MeshData) -> bool:
+        cached = self._geometry_buffer_cache.get(cache_key)
+        if cached is None:
+            return False
+        self._release_transient_mesh_buffers()
+        self._vertex_buffer = cached.vertex_buffer
+        self._index_buffer = cached.index_buffer
+        self._active_geometry_cache_key = cache_key
+        return True
+
+    def _create_geometry_buffers(self, mesh: MeshData, cache_key: str | None = None) -> None:
+        assert self.device is not None and wgpu is not None
+        vertex_buffer = self.device.create_buffer_with_data(
+            label=f"VFXTL {mesh.name} vertices", data=mesh.vertices, usage=wgpu.BufferUsage.VERTEX
+        )
+        index_buffer = self.device.create_buffer_with_data(
+            label=f"VFXTL {mesh.name} indices", data=mesh.indices, usage=wgpu.BufferUsage.INDEX
+        )
+        self._release_transient_mesh_buffers()
+        if cache_key:
+            buffer_set = _GeometryBufferSet(
+                vertex_buffer,
+                index_buffer,
+                int(mesh.vertices.nbytes) + int(mesh.indices.nbytes),
+            )
+            self._geometry_buffer_cache.put(cache_key, buffer_set)
+            self._active_geometry_cache_key = cache_key
+        else:
+            self._active_geometry_cache_key = None
+        self._vertex_buffer = vertex_buffer
+        self._index_buffer = index_buffer
+
     def _ensure_mesh(self) -> None:
         if not self.available:
             return
         assert self.device is not None and wgpu is not None
+        geometry_cache_key: str | None = None
         if self._geometry_override is not None:
             mesh = self._geometry_override
-            key = ("graph-geometry", self._geometry_override_token, mesh.vertex_count, mesh.triangle_count)
+            geometry_cache_key = str(getattr(mesh, "cache_key", "") or "") or None
+            key = (
+                "graph-geometry",
+                geometry_cache_key if geometry_cache_key is not None else self._geometry_override_token,
+                mesh.vertex_count,
+                mesh.triangle_count,
+            )
         else:
             mesh_name = str(self.settings.get("preview_mesh", "Terrain Plane"))
             quality = str(self.settings.get("mesh_quality", "High"))
@@ -985,12 +1118,10 @@ class ThreeDRenderer:
             return
         self._mesh = mesh
         self._mesh_key = key
-        self._vertex_buffer = self.device.create_buffer_with_data(
-            label=f"VFXTL {mesh.name} vertices", data=mesh.vertices, usage=wgpu.BufferUsage.VERTEX
-        )
-        self._index_buffer = self.device.create_buffer_with_data(
-            label=f"VFXTL {mesh.name} indices", data=mesh.indices, usage=wgpu.BufferUsage.INDEX
-        )
+        if geometry_cache_key and self._activate_geometry_buffers(geometry_cache_key, mesh):
+            pass
+        else:
+            self._create_geometry_buffers(mesh, geometry_cache_key)
         self._wire_mesh_key = None
         self._wire_index_buffer = None
         self._wire_index_count = 0
@@ -1640,7 +1771,17 @@ class ThreeDRenderer:
     def mesh_summary(self) -> str:
         if self._mesh is None:
             return "No mesh"
-        return f"{self._mesh.name} · {self._mesh.vertex_count:,} vertices · {self._mesh.triangle_count:,} triangles"
+        summary = (
+            f"{self._mesh.name} · {self._mesh.vertex_count:,} vertices · "
+            f"{self._mesh.triangle_count:,} triangles"
+        )
+        if (
+            self._geometry_inspection
+            and str(self.settings.get("wireframe", "Auto")) == "Auto"
+            and self._mesh.triangle_count > AUTO_WIREFRAME_TRIANGLE_LIMIT
+        ):
+            summary += " · Auto wireframe hidden for dense preview"
+        return summary
 
     def release(self) -> None:
         if self._active_material_cache_key is None:
@@ -1649,6 +1790,13 @@ class ThreeDRenderer:
         self._textures.clear()
         self._material_texture_cache.clear()
         self._active_material_cache_key = None
+        if self._active_geometry_cache_key is None:
+            self._destroy_buffer(self._vertex_buffer)
+            self._destroy_buffer(self._index_buffer)
+        self._vertex_buffer = None
+        self._index_buffer = None
+        self._geometry_buffer_cache.clear()
+        self._active_geometry_cache_key = None
         if self._environment is not None:
             self._environment.release()
             self._environment = None

@@ -39,6 +39,29 @@ class CachedMaterialResult:
 
 
 @dataclass(slots=True)
+class CachedGeometryMesh:
+    """Persistent CPU geometry result plus the stable renderer mesh wrapper.
+
+    Geometry evaluation is independent from ordinary Material channel changes.
+    Keeping the exact MeshData object alive gives the 3D renderer a stable
+    identity, allowing its vertex/index buffers to remain resident too.
+    """
+
+    geometry: Any
+    mesh: Any
+    revision: str
+    dynamic: bool = False
+
+    @property
+    def bytes_used(self) -> int:
+        vertices = getattr(self.geometry, "vertices", None)
+        indices = getattr(self.geometry, "indices", None)
+        total = int(vertices.nbytes) if isinstance(vertices, np.ndarray) else 0
+        total += int(indices.nbytes) if isinstance(indices, np.ndarray) else 0
+        return max(total, 64)
+
+
+@dataclass(slots=True)
 class CachedThumbnail:
     rgba: np.ndarray | None = None
     signal_value: Any = None

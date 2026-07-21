@@ -3,9 +3,11 @@ from __future__ import annotations
 from .base import NodeDefinition, ParameterSpec
 from .registry import NodeRegistry
 from ..geometry import (
-    evaluate_box_geometry, evaluate_combine_geometry, evaluate_cylinder_geometry,
-    evaluate_disc_ring_geometry, evaluate_displace_geometry, evaluate_normals_geometry,
-    evaluate_plane_geometry, evaluate_subdivide_geometry, evaluate_transform_geometry,
+    evaluate_bend_geometry, evaluate_box_geometry, evaluate_clean_weld_geometry,
+    evaluate_combine_geometry, evaluate_cylinder_geometry, evaluate_disc_ring_geometry,
+    evaluate_displace_geometry, evaluate_normals_geometry, evaluate_plane_geometry,
+    evaluate_ribbon_geometry, evaluate_subdivide_geometry, evaluate_transform_geometry,
+    evaluate_twist_geometry, evaluate_uv_transform_geometry,
 )
 
 
@@ -165,6 +167,44 @@ def register_geometry_nodes(registry: NodeRegistry) -> None:
     )
     registry.register(
         NodeDefinition(
+            type_id="geometry.ribbon",
+            name="Geometry Ribbon",
+            category="Geometry/Generators",
+            evaluator=None,
+            parameters=(
+                p("name", "Geometry name", "string", "Geometry Ribbon", group="Geometry", group_order=0),
+                p("length", "Length", "float", 4.0, 0.001, 10000.0, 0.05, group="Dimensions", group_order=10),
+                p("width_start", "Width Start", "float", 1.0, 0.0, 10000.0, 0.05, group="Dimensions", group_order=10),
+                p("width_end", "Width End", "float", 1.0, 0.0, 10000.0, 0.05, group="Dimensions", group_order=10),
+                p("length_segments", "Length Segments", "int", 16, 1, 2048, 1, group="Topology", group_order=20),
+                p("width_segments", "Width Segments", "int", 1, 1, 256, 1, group="Topology", group_order=20),
+                p(
+                    "orientation", "Orientation", "enum", "Horizontal (XZ)",
+                    options=("Horizontal (XZ)", "Vertical (XY)", "Vertical (YZ)"),
+                    group="Geometry", group_order=0,
+                ),
+                p("origin_x", "Origin X", "float", 0.0, -1.0, 1.0, 0.05, group="Origin", group_order=30),
+                p("origin_y", "Origin Y", "float", 0.0, -1.0, 1.0, 0.05, group="Origin", group_order=30),
+                p("origin_z", "Origin Z", "float", 0.0, -1.0, 1.0, 0.05, group="Origin", group_order=30),
+                p("rotation_x", "Rotation X", "float", 0.0, -3600.0, 3600.0, 1.0, group="Rotation", group_order=35, slider_minimum=-360.0, slider_maximum=360.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("rotation_y", "Rotation Y", "float", 0.0, -3600.0, 3600.0, 1.0, group="Rotation", group_order=35, slider_minimum=-360.0, slider_maximum=360.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("rotation_z", "Rotation Z", "float", 0.0, -3600.0, 3600.0, 1.0, group="Rotation", group_order=35, slider_minimum=-360.0, slider_maximum=360.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("uv_tiles_u", "UV Tiles U", "int", 1, 1, 64, 1, group="UV", group_order=40),
+                p("uv_tiles_v", "UV Tiles V", "int", 1, 1, 64, 1, group="UV", group_order=40),
+            ),
+            description=(
+                "Generate a straight, optionally tapered VFX ribbon with U across its width and V along its length. "
+                "Shared origin, XYZ rotation and integer UV tiling match the other Geometry generators."
+            ),
+            accent="#d2684a",
+            tags=("mesh", "ribbon", "trail", "beam", "slash", "card", "uv", "geometry"),
+            output_name="Geometry",
+            output_kinds=(("Geometry", "geometry"),),
+            geometry_evaluator=evaluate_ribbon_geometry,
+        )
+    )
+    registry.register(
+        NodeDefinition(
             type_id="geometry.transform",
             name="Geometry Transform",
             category="Geometry/Operations",
@@ -194,6 +234,115 @@ def register_geometry_nodes(registry: NodeRegistry) -> None:
             output_name="Geometry",
             output_kinds=(("Geometry", "geometry"),),
             geometry_evaluator=evaluate_transform_geometry,
+        )
+    )
+    registry.register(
+        NodeDefinition(
+            type_id="geometry.bend",
+            name="Geometry Bend",
+            category="Geometry/Operations",
+            evaluator=None,
+            inputs=("Geometry",),
+            input_kinds=(("Geometry", "geometry"),),
+            parameters=(
+                p("name", "Geometry name", "string", "Bent Geometry", group="Geometry", group_order=0),
+                p("amount", "Bend Amount", "float", 90.0, -3600.0, 3600.0, 1.0, group="Bend", group_order=10, slider_minimum=-360.0, slider_maximum=360.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("deformation_axis", "Deformation Axis", "enum", "Axis Z", options=("Axis X", "Axis Y", "Axis Z"), group="Bend", group_order=10),
+                p("direction", "Bend Direction", "float", 0.0, -3600.0, 3600.0, 1.0, description="Rotate the bend plane around the deformation axis.", group="Bend", group_order=10, slider_minimum=-180.0, slider_maximum=180.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("pivot_mode", "Bend Around", "enum", "Current Origin", options=("Current Origin", "Bounds Centre"), group="Pivot", group_order=20),
+                p("range_start", "Range Start", "float", 0.0, 0.0, 1.0, 0.01, group="Range", group_order=30),
+                p("range_end", "Range End", "float", 1.0, 0.0, 1.0, 0.01, group="Range", group_order=30),
+                p("clamp_outside", "Clamp Outside Range", "bool", True, description="Keep geometry beyond the selected section rigid and continue it along the end tangents.", group="Range", group_order=30),
+            ),
+            description=(
+                "Bend any sufficiently segmented mesh into a circular arc. Direction rotates the bend plane, while the normalised range can deform only part of the mesh without breaking continuity."
+            ),
+            accent="#c45f44",
+            tags=("mesh", "bend", "curve", "arc", "deform", "geometry"),
+            output_name="Geometry",
+            output_kinds=(("Geometry", "geometry"),),
+            geometry_evaluator=evaluate_bend_geometry,
+        )
+    )
+    registry.register(
+        NodeDefinition(
+            type_id="geometry.twist",
+            name="Geometry Twist",
+            category="Geometry/Operations",
+            evaluator=None,
+            inputs=("Geometry",),
+            input_kinds=(("Geometry", "geometry"),),
+            parameters=(
+                p("name", "Geometry name", "string", "Twisted Geometry", group="Geometry", group_order=0),
+                p("amount", "Twist Amount", "float", 180.0, -7200.0, 7200.0, 1.0, group="Twist", group_order=10, slider_minimum=-720.0, slider_maximum=720.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("axis", "Twist Axis", "enum", "Axis Z", options=("Axis X", "Axis Y", "Axis Z"), group="Twist", group_order=10),
+                p("pivot_mode", "Twist Around", "enum", "Current Origin", options=("Current Origin", "Bounds Centre"), group="Pivot", group_order=20),
+                p("range_start", "Range Start", "float", 0.0, 0.0, 1.0, 0.01, group="Range", group_order=30),
+                p("range_end", "Range End", "float", 1.0, 0.0, 1.0, 0.01, group="Range", group_order=30),
+                p("clamp_outside", "Clamp Outside Range", "bool", True, group="Range", group_order=30),
+            ),
+            description="Twist any mesh around its current origin or bounds centre, with a normalised deformation range and matching normal rotation.",
+            accent="#c45f44",
+            tags=("mesh", "twist", "spiral", "deform", "geometry"),
+            output_name="Geometry",
+            output_kinds=(("Geometry", "geometry"),),
+            geometry_evaluator=evaluate_twist_geometry,
+        )
+    )
+    registry.register(
+        NodeDefinition(
+            type_id="geometry.uv_transform",
+            name="Geometry UV Transform",
+            category="Geometry/Operations",
+            evaluator=None,
+            inputs=("Geometry",),
+            input_kinds=(("Geometry", "geometry"),),
+            parameters=(
+                p("name", "Geometry name", "string", "UV Transformed Geometry", group="Geometry", group_order=0),
+                p("scale_u", "Scale U", "float", 1.0, -1000.0, 1000.0, 0.01, slider_minimum=-8.0, slider_maximum=8.0, group="Scale", group_order=10),
+                p("scale_v", "Scale V", "float", 1.0, -1000.0, 1000.0, 0.01, slider_minimum=-8.0, slider_maximum=8.0, group="Scale", group_order=10),
+                p("offset_u", "Offset U", "float", 0.0, -1000.0, 1000.0, 0.01, slider_minimum=-4.0, slider_maximum=4.0, group="Offset", group_order=20),
+                p("offset_v", "Offset V", "float", 0.0, -1000.0, 1000.0, 0.01, slider_minimum=-4.0, slider_maximum=4.0, group="Offset", group_order=20),
+                p("rotation", "Rotation", "float", 0.0, -3600.0, 3600.0, 1.0, group="Rotation", group_order=30, slider_minimum=-360.0, slider_maximum=360.0, editor="angle", unit="degrees", angle_wrap=False, fine_step=1.0, coarse_step=15.0),
+                p("pivot_u", "Pivot U", "float", 0.5, -1000.0, 1000.0, 0.01, slider_minimum=0.0, slider_maximum=1.0, group="Pivot", group_order=40),
+                p("pivot_v", "Pivot V", "float", 0.5, -1000.0, 1000.0, 0.01, slider_minimum=0.0, slider_maximum=1.0, group="Pivot", group_order=40),
+                p("flip_u", "Flip U", "bool", False, group="Orientation", group_order=50),
+                p("flip_v", "Flip V", "bool", False, group="Orientation", group_order=50),
+                p("swap_uv", "Swap U / V", "bool", False, group="Orientation", group_order=50),
+            ),
+            description="Scale, offset, rotate, flip or swap mesh UV coordinates without changing positions, normals or topology.",
+            accent="#c45f44",
+            tags=("mesh", "uv", "transform", "tile", "offset", "rotate", "geometry"),
+            output_name="Geometry",
+            output_kinds=(("Geometry", "geometry"),),
+            geometry_evaluator=evaluate_uv_transform_geometry,
+        )
+    )
+    registry.register(
+        NodeDefinition(
+            type_id="geometry.clean_weld",
+            name="Geometry Clean / Weld",
+            category="Geometry/Operations",
+            evaluator=None,
+            inputs=("Geometry",),
+            input_kinds=(("Geometry", "geometry"),),
+            parameters=(
+                p("name", "Geometry name", "string", "Cleaned Geometry", group="Geometry", group_order=0),
+                p("remove_degenerate", "Remove Degenerate Triangles", "bool", True, group="Cleanup", group_order=10),
+                p("remove_unused", "Remove Unused Vertices", "bool", True, group="Cleanup", group_order=10),
+                p("merge_vertices", "Merge Compatible Vertices", "bool", True, group="Weld", group_order=20),
+                p("weld_distance", "Weld Distance", "float", 0.0, 0.0, 1000.0, 0.0001, description="Zero merges exact duplicates. Positive values use a spatial tolerance.", slider_minimum=0.0, slider_maximum=1.0, fine_step=0.0001, coarse_step=0.01, group="Weld", group_order=20, visible_when=(("merge_vertices", (True,)),)),
+                p("preserve_uv_seams", "Preserve UV Seams", "bool", True, group="Preservation", group_order=30, visible_when=(("merge_vertices", (True,)),)),
+                p("preserve_hard_edges", "Preserve Hard Normal Edges", "bool", True, group="Preservation", group_order=30, visible_when=(("merge_vertices", (True,)),)),
+            ),
+            description=(
+                "Remove unused vertices and degenerate triangles, then merge compatible duplicates or weld within a tolerance. UV seams and hard normal boundaries are preserved by default."
+            ),
+            accent="#c45f44",
+            tags=("mesh", "clean", "weld", "merge", "duplicate", "degenerate", "geometry"),
+            output_name="Geometry",
+            output_kinds=(("Geometry", "geometry"),),
+            geometry_evaluator=evaluate_clean_weld_geometry,
         )
     )
     registry.register(

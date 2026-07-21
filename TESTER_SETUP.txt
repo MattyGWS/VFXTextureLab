@@ -1,4 +1,4 @@
-VFX TEXTURE LAB 0.38.0 - SOURCE TESTING SETUP
+VFX TEXTURE LAB - SOURCE TESTING SETUP
 ================================================
 
 This is a development/testing copy, not a finished installed application.

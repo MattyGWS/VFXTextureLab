@@ -38,7 +38,7 @@ from .engine import AsyncEvaluationController, GraphEvaluator, GraphSnapshot
 from .engine.evaluator import _prepare_cpu_preview_rgba8
 from .engine.cache import MemoryLRU
 from .flipbook import extract_native_flipbook_cell
-from .nodes.base import EvalContext
+from .nodes.base import EvalContext, is_image_kind, normalise_port_kind
 from .material_graph import MATERIAL_PRODUCER_TYPES
 from .geometry import export_obj
 from .geometry_graph import GeometryEvaluationSession, material_geometry_reference
@@ -48,7 +48,10 @@ from .graph_assets import (
     GRAPH_INSTANCE_TYPE, graph_instance_definition, instance_parameters_for_asset,
     parse_graph_asset_interface,
 )
-from .preview_cache import CachedMaterialResult, CachedPreviewResult, CachedThumbnail, PresentationCacheTrace
+from .preview_cache import (
+    CachedGeometryMesh, CachedMaterialResult, CachedPreviewResult, CachedThumbnail,
+    PresentationCacheTrace,
+)
 from .portable_graph import (
     SelfContainedGraphError, build_self_contained_graph, recovery_summary,
     validate_self_contained_graph,
@@ -226,6 +229,9 @@ class MainWindow(QMainWindow):
         self._thumbnail_cache: MemoryLRU[CachedThumbnail] = MemoryLRU(32 * 1024 * 1024)
         self._material_result_cache: MemoryLRU[CachedMaterialResult] = MemoryLRU(
             max(gpu_budget_mb // 2, 128) * 1024 * 1024
+        )
+        self._geometry_result_cache: MemoryLRU[CachedGeometryMesh] = MemoryLRU(
+            max(gpu_budget_mb // 2, 256) * 1024 * 1024
         )
         self._material_preview_metadata: OrderedDict[str, MaterialEvaluationResult] = OrderedDict()
         self._material_preview_metadata_limit = 64
@@ -1783,8 +1789,116 @@ class MainWindow(QMainWindow):
         return any(node.output_data_kind(name) == "geometry" for name in node.definition.output_names)
 
     @staticmethod
-    def _mesh_from_geometry(geometry) -> MeshData:
-        return MeshData(geometry.vertices, geometry.indices, geometry.name)
+    def _mesh_from_geometry(geometry, *, cache_key: str = "") -> MeshData:
+        return MeshData(geometry.vertices, geometry.indices, geometry.name, cache_key)
+
+    @staticmethod
+    def _snapshot_geometry_branch_dynamic(snapshot: GraphSnapshot, source_uid: str) -> bool:
+        """Return whether a geometry branch can vary with timeline/state.
+
+        Geometry nodes themselves are ordinarily static, but Geometry Displace
+        may bridge to animated or stateful image branches. Static meshes should
+        use one persistent cache entry for every Material edit and playback frame.
+        """
+        visited: set[str] = set()
+        stack = [str(source_uid)]
+        while stack:
+            uid = stack.pop()
+            if uid in visited:
+                continue
+            visited.add(uid)
+            node = snapshot.nodes.get(uid)
+            if node is None:
+                continue
+            if (
+                node.definition.uses_time
+                or node.definition.is_stateful
+                or (node.definition.gpu_spec is not None and node.definition.gpu_spec.uses_time)
+            ):
+                return True
+            for input_name in node.input_names:
+                source = snapshot.inputs.get((uid, input_name))
+                if source is not None:
+                    stack.append(str(source[0]))
+        return False
+
+    @staticmethod
+    def _snapshot_geometry_branch_uses_images(snapshot: GraphSnapshot, source_uid: str) -> bool:
+        visited: set[str] = set()
+        stack = [str(source_uid)]
+        while stack:
+            uid = stack.pop()
+            if uid in visited:
+                continue
+            visited.add(uid)
+            node = snapshot.nodes.get(uid)
+            if node is None:
+                continue
+            for input_name in node.input_names:
+                source = snapshot.inputs.get((uid, input_name))
+                if source is None:
+                    continue
+                input_kind = normalise_port_kind(node.definition.input_kind(input_name))
+                if is_image_kind(input_kind):
+                    return True
+                stack.append(str(source[0]))
+        return False
+
+    def _geometry_cache_key(
+        self,
+        snapshot: GraphSnapshot,
+        source_uid: str,
+        output_name: str,
+        session: GeometryEvaluationSession,
+    ) -> tuple[str, str, bool]:
+        revision = self.evaluator.branch_revision(snapshot, source_uid)
+        dynamic = self._snapshot_geometry_branch_dynamic(snapshot, source_uid)
+        image_dependent = self._snapshot_geometry_branch_uses_images(snapshot, source_uid)
+        animation = session.animation
+        payload = {
+            "revision": revision,
+            "source_uid": str(source_uid),
+            "output": str(output_name or "Geometry"),
+            # Pure geometry is resolution/colour-space independent. Image-backed
+            # deformation keeps those context fields because sampling can change.
+            "width": int(session.width) if image_dependent else None,
+            "height": int(session.height) if image_dependent else None,
+            "precision": str(session.precision) if image_dependent else None,
+            "colour_space": str(session.colour_space) if image_dependent else None,
+            "render_mode": str(session.render_mode) if image_dependent else None,
+            "frame": int(animation.get("frame_number", 0)) if dynamic else None,
+            "frame_position": (
+                round(float(animation.get("frame_position", 0.0)), 6) if dynamic else None
+            ),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        key = "geometry:" + hashlib.blake2b(encoded, digest_size=20).hexdigest()
+        return key, revision, dynamic
+
+    def _cached_geometry_mesh(
+        self,
+        snapshot: GraphSnapshot,
+        source_uid: str,
+        output_name: str = "Geometry",
+        *,
+        final: bool = False,
+    ) -> tuple[MeshData | None, str | None, str | None, bool]:
+        session = self._geometry_evaluation_session(snapshot, final=final)
+        cache_key, revision, dynamic = self._geometry_cache_key(
+            snapshot, source_uid, output_name, session
+        )
+        cached = self._geometry_result_cache.get(cache_key)
+        if cached is not None:
+            return cached.mesh, revision, None, True
+        result = session.evaluate(source_uid, output_name)
+        if result.error or result.geometry is None:
+            return None, revision, result.error or "No geometry was produced", False
+        mesh = self._mesh_from_geometry(result.geometry, cache_key=cache_key)
+        self._geometry_result_cache.put(
+            cache_key,
+            CachedGeometryMesh(result.geometry, mesh, revision, dynamic),
+        )
+        return mesh, revision, None, False
 
     def _geometry_evaluation_session(
         self, snapshot: GraphSnapshot, *, final: bool = False
@@ -1826,10 +1940,12 @@ class MainWindow(QMainWindow):
                     (name for name in node.definition.output_names if node.output_data_kind(name) == "geometry"),
                     "Geometry",
                 )
-        result = self._geometry_evaluation_session(graph).evaluate(node.uid, output_name)
-        if result.error or result.geometry is None:
-            return None, result.error or "No geometry was produced"
-        return self._mesh_from_geometry(result.geometry), None
+        mesh, _revision, error, _cache_hit = self._cached_geometry_mesh(
+            graph, node.uid, output_name
+        )
+        if mesh is None:
+            return None, error or "No geometry was produced"
+        return mesh, None
 
     def _show_geometry_node(self, node) -> bool:
         mesh, error = self._evaluate_geometry_node(node)
@@ -1871,11 +1987,12 @@ class MainWindow(QMainWindow):
             reference = material_geometry_reference(graph, target_uid)
             if reference is None:
                 return None, None, None
-            result = self._geometry_evaluation_session(graph).evaluate(*reference)
-            if result.error or result.geometry is None:
-                return None, None, result.error or "Material geometry produced no mesh"
-            revision = self.evaluator.branch_revision(graph, reference[0])
-            return self._mesh_from_geometry(result.geometry), revision, None
+            mesh, revision, error, _cache_hit = self._cached_geometry_mesh(
+                graph, reference[0], reference[1]
+            )
+            if mesh is None:
+                return None, revision, error or "Material geometry produced no mesh"
+            return mesh, revision, None
         except Exception as exc:
             return None, None, f"{type(exc).__name__}: {exc}"
 
@@ -2200,10 +2317,15 @@ class MainWindow(QMainWindow):
         self._material_preview_metadata.move_to_end(key)
         return metadata
 
+    def _clear_geometry_caches(self) -> None:
+        self._geometry_result_cache.clear()
+        self.preview_3d_panel.canvas.renderer.clear_geometry_cache()
+
     def _clear_presentation_caches(self) -> None:
         self._preview_result_cache.clear()
         self._thumbnail_cache.clear()
         self._material_result_cache.clear()
+        self._clear_geometry_caches()
         self._material_preview_metadata.clear()
         self._last_material_result_key = None
         self._pending_preview_cache_key = None
@@ -3920,9 +4042,20 @@ class MainWindow(QMainWindow):
             if callable(clear_material_activity):
                 clear_material_activity()
 
+    def _refresh_active_geometry_after_state_reset(self) -> None:
+        active = self.scene.active_node
+        if self._is_geometry_preview_node(active):
+            self._show_geometry_node(active)
+            return
+        material = self._find_3d_output()
+        if material is not None:
+            self._refresh_material_geometry_override(material)
+
     def _reset_all_simulations(self) -> None:
         self._cancel_interactive_previews()
         self.evaluator.reset_simulations()
+        self._clear_geometry_caches()
+        self._refresh_active_geometry_after_state_reset()
         self.statusBar().showMessage("All simulation state reset", 3500)
         self._schedule_preview()
         self._schedule_3d_preview()
@@ -3930,6 +4063,8 @@ class MainWindow(QMainWindow):
     def _reset_simulation_node(self, node_uid: str) -> None:
         self._cancel_interactive_previews()
         self.evaluator.reset_simulations(node_uid)
+        self._clear_geometry_caches()
+        self._refresh_active_geometry_after_state_reset()
         node = self.scene.nodes.get(node_uid)
         name = node.definition.name if node is not None else "Simulation"
         self.statusBar().showMessage(f"{name} state reset", 3500)
@@ -5890,7 +6025,9 @@ class MainWindow(QMainWindow):
         for node in self.scene.nodes.values():
             if node.thumbnail_enabled:
                 node.clear_thumbnail_result(keep_image=False, state="not_evaluated", message="Not evaluated")
-        self.statusBar().showMessage("Graph, presentation, thumbnail and 3D material caches cleared", 3500)
+        self.statusBar().showMessage(
+            "Graph, geometry, presentation, thumbnail and 3D renderer caches cleared", 3500
+        )
         self._schedule_preview()
         self._schedule_3d_preview()
         self._schedule_thumbnail_refresh()
@@ -5912,9 +6049,11 @@ class MainWindow(QMainWindow):
         cpu_value = max(value // 2, 128)
         self.evaluator.set_memory_budget_mb(value, cpu_value)
         self._material_result_cache.set_budget(cpu_value * 1024 * 1024)
+        self._geometry_result_cache.set_budget(max(cpu_value, 256) * 1024 * 1024)
         self.preview_3d_panel.set_material_cache_budget_mb(value)
         self.statusBar().showMessage(
-            f"Render cache budget set to {value} MiB graph GPU + 3D material GPU / {cpu_value} MiB graph and resolved-material CPU",
+            f"Render cache budget set to {value} MiB graph/material GPU + resident geometry / "
+            f"{cpu_value} MiB graph/material CPU",
             5000,
         )
 
@@ -5926,7 +6065,9 @@ class MainWindow(QMainWindow):
         preview_cache = self._preview_result_cache.stats()
         thumbnail_cache = self._thumbnail_cache.stats()
         material_cpu_cache = self._material_result_cache.stats()
+        geometry_cpu_cache = self._geometry_result_cache.stats()
         material_gpu_cache = self.preview_3d_panel.material_cache_stats()
+        geometry_gpu_cache = self.preview_3d_panel.canvas.renderer.geometry_cache_stats()
         supported = "<br>".join(info["supported_gpu_nodes"]) or "None"
         QMessageBox.information(
             self,
@@ -5939,7 +6080,9 @@ class MainWindow(QMainWindow):
             f"<b>2D presentation cache:</b> {preview_cache.entries} entries, {preview_cache.bytes_used / 1048576:.1f} / {preview_cache.budget_bytes / 1048576:.0f} MiB<br>"
             f"<b>Node thumbnail cache:</b> {thumbnail_cache.entries} entries, {thumbnail_cache.bytes_used / 1048576:.1f} / {thumbnail_cache.budget_bytes / 1048576:.0f} MiB<br>"
             f"<b>Resolved material CPU cache:</b> {material_cpu_cache.entries} entries, {material_cpu_cache.bytes_used / 1048576:.1f} / {material_cpu_cache.budget_bytes / 1048576:.0f} MiB<br>"
-            f"<b>3D renderer material cache:</b> {material_gpu_cache.entries} sets, {material_gpu_cache.bytes_used / 1048576:.1f} / {material_gpu_cache.budget_bytes / 1048576:.0f} MiB<br><br>"
+            f"<b>Procedural geometry CPU cache:</b> {geometry_cpu_cache.entries} meshes, {geometry_cpu_cache.bytes_used / 1048576:.1f} / {geometry_cpu_cache.budget_bytes / 1048576:.0f} MiB<br>"
+            f"<b>3D renderer material cache:</b> {material_gpu_cache.entries} sets, {material_gpu_cache.bytes_used / 1048576:.1f} / {material_gpu_cache.budget_bytes / 1048576:.0f} MiB<br>"
+            f"<b>3D renderer geometry cache:</b> {geometry_gpu_cache.entries} meshes, {geometry_gpu_cache.bytes_used / 1048576:.1f} / {geometry_gpu_cache.budget_bytes / 1048576:.0f} MiB<br><br>"
             f"<b>Current document:</b> {self.document.width} × {self.document.height} · {self.document.working_precision}<br>"
             f"<b>GPU physical storage:</b> scalar R32Float · colour {'RGBA32Float' if self.document.texture_precision.value == 'rgba32f' else 'RGBA16Float'}<br>"
             f"<b>Two-component foundation:</b> RG32Float<br>"
@@ -5947,7 +6090,7 @@ class MainWindow(QMainWindow):
             f"shared WebGPU device · {self.preview_3d_panel.canvas.renderer.mesh_summary}<br><br>"
             f"<b>WGSL texture nodes:</b><br>{supported}<br><br>"
             f"<b>CPU decode nodes:</b><br>Image Input (then uploaded for downstream GPU work)<br><br>"
-            f"<b>3D material bridge:</b><br>Only authored channels are resolved. Recently focused materials retain resolved CPU maps and mipmapped renderer textures, so unchanged focus switches can skip graph evaluation, readback and upload. Direct graph-texture binding remains a future optimisation.",
+            f"<b>3D material / geometry bridge:</b><br>Only authored channels are resolved. Recently focused materials retain resolved CPU maps and mipmapped renderer textures. Procedural meshes are cached by their own upstream branch revision and keep resident vertex/index buffers, so unrelated Material edits skip subdivision, mesh conversion and GPU upload. Direct graph-texture binding remains a future optimisation.",
         )
 
     def _set_dirty(self, dirty: bool) -> None:
@@ -8080,7 +8223,7 @@ class MainWindow(QMainWindow):
             "About VFX Texture Lab",
             f"<b>VFX Texture Lab {__version__}</b><br><br>"
             "A focused, open-source procedural texture graph for VFX artists.<br><br>"
-            "0.49.0 expands the Geometry toolkit with Transform, Subdivide, explicit Normals and Disc / Ring nodes, while Geometry Displace now preserves authored mesh normals.",
+            "0.50.0 adds VFX Ribbon generation plus Bend, Twist, UV Transform and seam-aware Geometry Clean / Weld operations.",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:

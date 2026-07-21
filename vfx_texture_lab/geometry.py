@@ -779,6 +779,446 @@ def disc_ring_geometry(
     )
 
 
+
+def ribbon_geometry(
+    length: float = 4.0,
+    width_start: float = 1.0,
+    width_end: float = 1.0,
+    length_segments: int = 16,
+    width_segments: int = 1,
+    orientation: str = "Horizontal (XZ)",
+    *,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+    origin_z: float = 0.0,
+    rotation_x: float = 0.0,
+    rotation_y: float = 0.0,
+    rotation_z: float = 0.0,
+    uv_tiles_u: int = 1,
+    uv_tiles_v: int = 1,
+    name: str = "Geometry Ribbon",
+) -> GeometryData:
+    """Generate a straight tapered ribbon with predictable scrolling UVs.
+
+    U runs across the ribbon width and V runs from Width Start to Width End.
+    The three base orientations mirror Geometry Plane conventions so origin,
+    rotation and downstream deformation behave consistently across generators.
+    """
+
+    length = max(float(length), 1.0e-6)
+    width_start = max(float(width_start), 0.0)
+    width_end = max(float(width_end), 0.0)
+    if width_start <= 1.0e-8 and width_end <= 1.0e-8:
+        raise ValueError("Geometry Ribbon requires Width Start or Width End above zero")
+    length_segments = min(max(int(length_segments), 1), 2048)
+    width_segments = min(max(int(width_segments), 1), 256)
+
+    columns = width_segments + 1
+    rows = length_segments + 1
+    u_values = np.linspace(0.0, 1.0, columns, dtype=np.float32)
+    v_values = np.linspace(0.0, 1.0, rows, dtype=np.float32)
+    positions = np.empty((rows, columns, 3), dtype=np.float32)
+    normals = np.zeros_like(positions)
+    uvs = np.empty((rows, columns, 2), dtype=np.float32)
+    orientation = str(orientation or "Horizontal (XZ)")
+
+    for row, v in enumerate(v_values):
+        width = width_start * (1.0 - float(v)) + width_end * float(v)
+        across = (u_values - 0.5) * width
+        along = (0.5 - float(v)) * length
+        if orientation == "Vertical (XY)":
+            positions[row, :, 0] = across
+            positions[row, :, 1] = along
+            positions[row, :, 2] = 0.0
+            normals[row, :, 2] = 1.0
+        elif orientation == "Vertical (YZ)":
+            positions[row, :, 0] = 0.0
+            positions[row, :, 1] = along
+            positions[row, :, 2] = across
+            normals[row, :, 0] = 1.0
+        else:
+            positions[row, :, 0] = across
+            positions[row, :, 1] = 0.0
+            positions[row, :, 2] = along
+            normals[row, :, 1] = 1.0
+        uvs[row, :, 0] = u_values
+        uvs[row, :, 1] = float(v)
+
+    indices: list[int] = []
+    for row in range(length_segments):
+        for column in range(width_segments):
+            a = row * columns + column
+            b = a + 1
+            c = a + columns
+            d = c + 1
+            collapsed_start = row == 0 and width_start <= 1.0e-8
+            collapsed_end = row + 1 == length_segments and width_end <= 1.0e-8
+            if orientation == "Vertical (XY)":
+                first = (a, c, b)
+                second = (b, c, d)
+            else:
+                first = (a, b, c)
+                second = (b, d, c)
+            # At a zero-width end, one triangle of each final quad collapses.
+            # Keep only the valid fan triangle while retaining separate UV-tip
+            # vertices for each width segment.
+            if collapsed_start:
+                indices.extend(second)
+            elif collapsed_end:
+                indices.extend(first)
+            else:
+                indices.extend((*first, *second))
+
+    return _finalise_geometry(
+        positions.reshape(-1, 3),
+        normals.reshape(-1, 3),
+        uvs.reshape(-1, 2),
+        np.asarray(indices, dtype=np.uint32),
+        name,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        origin_z=origin_z,
+        rotation_x=rotation_x,
+        rotation_y=rotation_y,
+        rotation_z=rotation_z,
+        uv_tiles_u=uv_tiles_u,
+        uv_tiles_v=uv_tiles_v,
+    )
+
+
+def _axis_vector(axis: str) -> np.ndarray:
+    value = str(axis or "Axis Y")
+    if value == "Axis X":
+        return np.asarray((1.0, 0.0, 0.0), dtype=np.float32)
+    if value == "Axis Z":
+        return np.asarray((0.0, 0.0, 1.0), dtype=np.float32)
+    return np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+
+
+def _rotate_about_axis(
+    vectors: np.ndarray,
+    axis: np.ndarray,
+    angles: np.ndarray | float,
+) -> np.ndarray:
+    """Rotate one or many vectors around one unit axis using Rodrigues' formula."""
+
+    values = np.asarray(vectors, dtype=np.float32)
+    unit_axis = np.asarray(axis, dtype=np.float32)
+    unit_axis /= max(float(np.linalg.norm(unit_axis)), 1.0e-8)
+    theta = np.asarray(angles, dtype=np.float32)
+    if theta.ndim == 0:
+        theta = np.full((values.shape[0],), float(theta), dtype=np.float32)
+    theta = theta.reshape(-1, 1)
+    cosine = np.cos(theta)
+    sine = np.sin(theta)
+    cross = np.cross(np.broadcast_to(unit_axis, values.shape), values)
+    projection = values @ unit_axis
+    return (
+        values * cosine
+        + cross * sine
+        + projection[:, None] * unit_axis[None, :] * (1.0 - cosine)
+    ).astype(np.float32, copy=False)
+
+
+def _geometry_pivot(positions: np.ndarray, pivot_mode: str) -> np.ndarray:
+    if str(pivot_mode or "Current Origin") == "Bounds Centre" and positions.size:
+        return ((positions.min(axis=0) + positions.max(axis=0)) * 0.5).astype(np.float32)
+    return np.zeros(3, dtype=np.float32)
+
+
+def _normalised_range(start: float, end: float) -> tuple[float, float]:
+    first = min(max(float(start), 0.0), 1.0)
+    second = min(max(float(end), 0.0), 1.0)
+    if second < first:
+        first, second = second, first
+    if second - first < 1.0e-5:
+        second = min(first + 1.0e-5, 1.0)
+        if second - first < 1.0e-5:
+            first = max(0.0, second - 1.0e-5)
+    return first, second
+
+
+def bend_geometry(
+    geometry: GeometryData,
+    *,
+    amount: float = 90.0,
+    deformation_axis: str = "Axis Z",
+    direction: float = 0.0,
+    pivot_mode: str = "Current Origin",
+    range_start: float = 0.0,
+    range_end: float = 1.0,
+    clamp_outside: bool = True,
+    name: str = "Bent Geometry",
+) -> GeometryData:
+    """Bend a mesh into a circular arc along one selected bounds axis.
+
+    ``direction`` rotates the bend plane around the deformation axis.  When
+    Clamp Outside Range is enabled, geometry beyond the selected section
+    continues rigidly along the start/end tangents instead of introducing a
+    positional discontinuity.
+    """
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Bend requires a connected Geometry input")
+    vertices = geometry.vertices.copy()
+    if not vertices.size or abs(float(amount)) <= 1.0e-8:
+        return GeometryData(vertices, geometry.indices.copy(), name)
+
+    positions = vertices[:, :3]
+    normals = vertices[:, 3:6]
+    longitudinal = _axis_vector(deformation_axis)
+    if str(deformation_axis or "Axis Z") == "Axis X":
+        base_radial = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+    else:
+        base_radial = np.asarray((1.0, 0.0, 0.0), dtype=np.float32)
+    radial = _rotate_about_axis(
+        base_radial.reshape(1, 3), longitudinal, math.radians(float(direction))
+    )[0]
+    radial /= max(float(np.linalg.norm(radial)), 1.0e-8)
+    binormal = np.cross(longitudinal, radial).astype(np.float32)
+    binormal /= max(float(np.linalg.norm(binormal)), 1.0e-8)
+
+    pivot = _geometry_pivot(positions, pivot_mode)
+    relative = positions - pivot
+    coordinate = relative @ longitudinal
+    radial_coordinate = relative @ radial
+    binormal_coordinate = relative @ binormal
+    minimum = float(coordinate.min())
+    maximum = float(coordinate.max())
+    extent = maximum - minimum
+    if extent <= 1.0e-8:
+        return GeometryData(vertices, geometry.indices.copy(), name)
+
+    start_amount, end_amount = _normalised_range(range_start, range_end)
+    start = minimum + extent * start_amount
+    end = minimum + extent * end_amount
+    section_length = max(end - start, 1.0e-8)
+    total_angle = math.radians(float(amount))
+    curvature = total_angle / section_length
+    if abs(curvature) <= 1.0e-10:
+        return GeometryData(vertices, geometry.indices.copy(), name)
+
+    local = coordinate - start
+    if clamp_outside:
+        bent_local = np.clip(local, 0.0, section_length)
+    else:
+        bent_local = local
+    theta = bent_local * curvature
+    radius = 1.0 / curvature
+    sine = np.sin(theta)
+    cosine = np.cos(theta)
+    long_out = start + (radius - radial_coordinate) * sine
+    radial_out = radius * (1.0 - cosine) + radial_coordinate * cosine
+
+    if clamp_outside:
+        before = np.minimum(local, 0.0)
+        after = np.maximum(local - section_length, 0.0)
+        long_out += before + after * math.cos(total_angle)
+        radial_out += after * math.sin(total_angle)
+
+    vertices[:, :3] = (
+        pivot
+        + long_out[:, None] * longitudinal[None, :]
+        + radial_out[:, None] * radial[None, :]
+        + binormal_coordinate[:, None] * binormal[None, :]
+    )
+    vertices[:, 3:6] = _normalised(
+        _rotate_about_axis(normals, binormal, theta), fallback=normals
+    )
+    return GeometryData(vertices, geometry.indices.copy(), name)
+
+
+def twist_geometry(
+    geometry: GeometryData,
+    *,
+    amount: float = 180.0,
+    axis: str = "Axis Z",
+    pivot_mode: str = "Current Origin",
+    range_start: float = 0.0,
+    range_end: float = 1.0,
+    clamp_outside: bool = True,
+    name: str = "Twisted Geometry",
+) -> GeometryData:
+    """Twist positions and normals around a selected origin/bounds axis."""
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Twist requires a connected Geometry input")
+    vertices = geometry.vertices.copy()
+    if not vertices.size or abs(float(amount)) <= 1.0e-8:
+        return GeometryData(vertices, geometry.indices.copy(), name)
+    positions = vertices[:, :3]
+    normals = vertices[:, 3:6]
+    twist_axis = _axis_vector(axis)
+    pivot = _geometry_pivot(positions, pivot_mode)
+    relative = positions - pivot
+    coordinate = relative @ twist_axis
+    minimum = float(coordinate.min())
+    maximum = float(coordinate.max())
+    extent = maximum - minimum
+    if extent <= 1.0e-8:
+        return GeometryData(vertices, geometry.indices.copy(), name)
+
+    start_amount, end_amount = _normalised_range(range_start, range_end)
+    start = minimum + extent * start_amount
+    end = minimum + extent * end_amount
+    section_length = max(end - start, 1.0e-8)
+    factor = (coordinate - start) / section_length
+    if clamp_outside:
+        factor = np.clip(factor, 0.0, 1.0)
+    angles = factor * math.radians(float(amount))
+
+    parallel = coordinate[:, None] * twist_axis[None, :]
+    radial = relative - parallel
+    vertices[:, :3] = pivot + parallel + _rotate_about_axis(radial, twist_axis, angles)
+    vertices[:, 3:6] = _normalised(
+        _rotate_about_axis(normals, twist_axis, angles), fallback=normals
+    )
+    return GeometryData(vertices, geometry.indices.copy(), name)
+
+
+def uv_transform_geometry(
+    geometry: GeometryData,
+    *,
+    scale_u: float = 1.0,
+    scale_v: float = 1.0,
+    offset_u: float = 0.0,
+    offset_v: float = 0.0,
+    rotation: float = 0.0,
+    pivot_u: float = 0.5,
+    pivot_v: float = 0.5,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    swap_uv: bool = False,
+    name: str = "UV Transformed Geometry",
+) -> GeometryData:
+    """Transform mesh UV coordinates without changing topology or positions."""
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry UV Transform requires a connected Geometry input")
+    vertices = geometry.vertices.copy()
+    uv = vertices[:, 6:8].copy()
+    if swap_uv:
+        uv = uv[:, ::-1]
+    pivot = np.asarray((float(pivot_u), float(pivot_v)), dtype=np.float32)
+    centred = uv - pivot
+    if flip_u:
+        centred[:, 0] *= -1.0
+    if flip_v:
+        centred[:, 1] *= -1.0
+    centred *= np.asarray((float(scale_u), float(scale_v)), dtype=np.float32)
+    angle = math.radians(float(rotation) % 360.0)
+    sine = math.sin(angle)
+    cosine = math.cos(angle)
+    matrix = np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float32)
+    vertices[:, 6:8] = (
+        centred @ matrix.T
+        + pivot
+        + np.asarray((float(offset_u), float(offset_v)), dtype=np.float32)
+    )
+    return GeometryData(vertices, geometry.indices.copy(), name)
+
+
+def _drop_degenerate_triangles(indices: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    triangles = np.asarray(indices, dtype=np.uint32).reshape(-1, 3)
+    if not triangles.size:
+        return triangles.reshape(-1)
+    distinct = (
+        (triangles[:, 0] != triangles[:, 1])
+        & (triangles[:, 1] != triangles[:, 2])
+        & (triangles[:, 2] != triangles[:, 0])
+    )
+    p0 = positions[triangles[:, 0]]
+    p1 = positions[triangles[:, 1]]
+    p2 = positions[triangles[:, 2]]
+    cross = np.cross(p1 - p0, p2 - p0)
+    bounds_extent = positions.max(axis=0) - positions.min(axis=0) if positions.size else np.zeros(3)
+    scale = max(float(np.linalg.norm(bounds_extent)), 1.0)
+    valid_area = np.einsum("ij,ij->i", cross, cross) > (scale * scale * 1.0e-12) ** 2
+    return np.ascontiguousarray(triangles[distinct & valid_area].reshape(-1), dtype=np.uint32)
+
+
+def _vertex_merge_keys(
+    vertices: np.ndarray,
+    weld_distance: float,
+    preserve_uv_seams: bool,
+    preserve_hard_edges: bool,
+) -> np.ndarray:
+    position = vertices[:, :3]
+    if weld_distance > 0.0:
+        position_key = np.rint(position / weld_distance).astype(np.int64)
+    else:
+        position_key = position.view(np.uint32).astype(np.int64)
+    parts = [position_key]
+    if preserve_hard_edges:
+        parts.append(vertices[:, 3:6].view(np.uint32).astype(np.int64))
+    if preserve_uv_seams:
+        parts.append(vertices[:, 6:8].view(np.uint32).astype(np.int64))
+    return np.ascontiguousarray(np.concatenate(parts, axis=1), dtype=np.int64)
+
+
+def clean_weld_geometry(
+    geometry: GeometryData,
+    *,
+    remove_degenerate: bool = True,
+    remove_unused: bool = True,
+    merge_vertices: bool = True,
+    weld_distance: float = 0.0,
+    preserve_uv_seams: bool = True,
+    preserve_hard_edges: bool = True,
+    name: str = "Cleaned Geometry",
+) -> GeometryData:
+    """Clean topology and optionally merge compatible vertices.
+
+    Exact duplicates are merged when Weld Distance is zero. Positive distances
+    use a deterministic spatial quantisation and average merged attributes.
+    Including UVs and normals in the merge key preserves seams and hard edges.
+    """
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Clean / Weld requires a connected Geometry input")
+    vertices = geometry.vertices.copy()
+    indices = geometry.indices.copy()
+    if remove_degenerate and indices.size:
+        indices = _drop_degenerate_triangles(indices, vertices[:, :3])
+
+    if merge_vertices and vertices.shape[0]:
+        distance = max(float(weld_distance), 0.0)
+        keys = _vertex_merge_keys(
+            vertices, distance, bool(preserve_uv_seams), bool(preserve_hard_edges)
+        )
+        packed = keys.view(np.dtype((np.void, keys.dtype.itemsize * keys.shape[1]))).reshape(-1)
+        _, first_indices, inverse = np.unique(
+            packed, return_index=True, return_inverse=True
+        )
+        group_count = int(inverse.max()) + 1 if inverse.size else 0
+        counts = np.bincount(inverse, minlength=group_count).astype(np.float32)
+        merged = np.empty((group_count, 8), dtype=np.float32)
+        for component in range(8):
+            merged[:, component] = np.bincount(
+                inverse, weights=vertices[:, component], minlength=group_count
+            ) / np.maximum(counts, 1.0)
+        merged[:, 3:6] = _normalised(
+            merged[:, 3:6], fallback=vertices[first_indices, 3:6]
+        )
+        vertices = merged
+        indices = inverse[indices].astype(np.uint32, copy=False)
+        if remove_degenerate and indices.size:
+            indices = _drop_degenerate_triangles(indices, vertices[:, :3])
+
+    if remove_unused and vertices.shape[0]:
+        if indices.size:
+            used = np.unique(indices)
+            remap = np.full((vertices.shape[0],), -1, dtype=np.int64)
+            remap[used] = np.arange(used.size, dtype=np.int64)
+            vertices = vertices[used]
+            indices = remap[indices].astype(np.uint32, copy=False)
+        else:
+            vertices = np.empty((0, 8), dtype=np.float32)
+            indices = np.empty((0,), dtype=np.uint32)
+
+    return GeometryData(vertices, indices, name)
+
+
 def combine_geometry(
     bottom: GeometryData,
     top: GeometryData,
@@ -1124,6 +1564,106 @@ def displace_geometry(
     # normal rebuilding belongs to the Geometry Normals node.
     vertices[:, 3:6] = normals
     return GeometryData(vertices, geometry.indices.copy(), name)
+
+
+
+def evaluate_ribbon_geometry(
+    _inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    return ribbon_geometry(
+        length=float(parameters.get("length", 4.0)),
+        width_start=float(parameters.get("width_start", 1.0)),
+        width_end=float(parameters.get("width_end", 1.0)),
+        length_segments=int(parameters.get("length_segments", 16)),
+        width_segments=int(parameters.get("width_segments", 1)),
+        orientation=str(parameters.get("orientation", "Horizontal (XZ)")),
+        origin_x=float(parameters.get("origin_x", 0.0)),
+        origin_y=float(parameters.get("origin_y", 0.0)),
+        origin_z=float(parameters.get("origin_z", 0.0)),
+        rotation_x=float(parameters.get("rotation_x", 0.0)),
+        rotation_y=float(parameters.get("rotation_y", 0.0)),
+        rotation_z=float(parameters.get("rotation_z", 0.0)),
+        uv_tiles_u=int(parameters.get("uv_tiles_u", 1)),
+        uv_tiles_v=int(parameters.get("uv_tiles_v", 1)),
+        name=str(parameters.get("name", "Geometry Ribbon") or "Geometry Ribbon"),
+    )
+
+
+def evaluate_bend_geometry(
+    inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return bend_geometry(
+        geometry,
+        amount=float(parameters.get("amount", 90.0)),
+        deformation_axis=str(parameters.get("deformation_axis", "Axis Z")),
+        direction=float(parameters.get("direction", 0.0)),
+        pivot_mode=str(parameters.get("pivot_mode", "Current Origin")),
+        range_start=float(parameters.get("range_start", 0.0)),
+        range_end=float(parameters.get("range_end", 1.0)),
+        clamp_outside=bool(parameters.get("clamp_outside", True)),
+        name=str(parameters.get("name", "Bent Geometry") or "Bent Geometry"),
+    )
+
+
+def evaluate_twist_geometry(
+    inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return twist_geometry(
+        geometry,
+        amount=float(parameters.get("amount", 180.0)),
+        axis=str(parameters.get("axis", "Axis Z")),
+        pivot_mode=str(parameters.get("pivot_mode", "Current Origin")),
+        range_start=float(parameters.get("range_start", 0.0)),
+        range_end=float(parameters.get("range_end", 1.0)),
+        clamp_outside=bool(parameters.get("clamp_outside", True)),
+        name=str(parameters.get("name", "Twisted Geometry") or "Twisted Geometry"),
+    )
+
+
+def evaluate_uv_transform_geometry(
+    inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return uv_transform_geometry(
+        geometry,
+        scale_u=float(parameters.get("scale_u", 1.0)),
+        scale_v=float(parameters.get("scale_v", 1.0)),
+        offset_u=float(parameters.get("offset_u", 0.0)),
+        offset_v=float(parameters.get("offset_v", 0.0)),
+        rotation=float(parameters.get("rotation", 0.0)),
+        pivot_u=float(parameters.get("pivot_u", 0.5)),
+        pivot_v=float(parameters.get("pivot_v", 0.5)),
+        flip_u=bool(parameters.get("flip_u", False)),
+        flip_v=bool(parameters.get("flip_v", False)),
+        swap_uv=bool(parameters.get("swap_uv", False)),
+        name=str(parameters.get("name", "UV Transformed Geometry") or "UV Transformed Geometry"),
+    )
+
+
+def evaluate_clean_weld_geometry(
+    inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return clean_weld_geometry(
+        geometry,
+        remove_degenerate=bool(parameters.get("remove_degenerate", True)),
+        remove_unused=bool(parameters.get("remove_unused", True)),
+        merge_vertices=bool(parameters.get("merge_vertices", True)),
+        weld_distance=float(parameters.get("weld_distance", 0.0)),
+        preserve_uv_seams=bool(parameters.get("preserve_uv_seams", True)),
+        preserve_hard_edges=bool(parameters.get("preserve_hard_edges", True)),
+        name=str(parameters.get("name", "Cleaned Geometry") or "Cleaned Geometry"),
+    )
 
 
 def evaluate_disc_ring_geometry(

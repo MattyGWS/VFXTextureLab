@@ -18,6 +18,7 @@ class MeshData:
     vertices: np.ndarray  # float32, N x 8: position.xyz, normal.xyz, uv.xy
     indices: np.ndarray  # uint32 triangles
     name: str = "Mesh"
+    cache_key: str = ""
 
     def __post_init__(self) -> None:
         self.vertices = np.ascontiguousarray(self.vertices, dtype=np.float32).reshape(-1, 8)

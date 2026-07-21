@@ -1,3 +1,29 @@
+# Changelog
+
+## 0.50.0 — VFX Geometry Shaping
+
+- Added **Geometry Ribbon**, generating straight or tapered segmented strips with three base orientations, shared Origin/XYZ Rotation controls and integer U/V tiling. U runs across width and V along length for predictable beams, trails, slashes and scrolling effects.
+- Added **Geometry Bend**, a vectorised circular-arc deformation with signed angle, axis, bend-plane direction, origin/bounds pivot, normalised range and continuous rigid tails outside a clamped range.
+- Added **Geometry Twist**, progressively rotating positions and stored normals around X, Y or Z with origin/bounds pivot and a controllable normalised range.
+- Added **Geometry UV Transform**, applying U/V swap, flip, scale, rotation, pivot and offset without changing mesh positions, normals, topology or export origin.
+- Added **Geometry Clean / Weld**, removing degenerate triangles and unused vertices and merging exact or tolerance-based compatible vertices while preserving UV seams and hard-normal boundaries by default.
+- Kept all new operations inside the persistent geometry-result and GPU-buffer cache path introduced in 0.49.1; unchanged shaping chains remain resident across unrelated Material edits.
+- Replaced the release-history duplicate in `README.md` with a stable GitHub-facing application overview covering use cases, features, workflows, performance, formats, setup and documentation. Release notes now live exclusively in this changelog.
+- Added `docs/GEOMETRY_SHAPING.md`, `docs/TESTING_0.50.0.md` and focused pure-geometry regression coverage.
+- Graph format remains version 18. Existing geometry graphs load unchanged.
+
+## 0.49.1 — Persistent Geometry Performance
+
+- Added a byte-budgeted persistent procedural-geometry cache keyed by the geometry branch's own upstream content revision rather than the overall graph revision. Unrelated Material edits now reuse the exact existing mesh instead of rerunning Geometry Subdivide, Displace, Transform, Normals or Combine.
+- Pure Geometry branches are resolution, colour-space and playback-quality independent in the cache. Geometry Displace branches remain correctly keyed by image sampling resolution, precision and timeline frame when their height input is dynamic.
+- Added stable geometry identities to renderer meshes. Rewrapping or refocusing an unchanged procedural mesh no longer invalidates the 3D viewport mesh.
+- Added a byte-budgeted renderer geometry cache that keeps recent vertex and index buffers GPU-resident. Switching away from and back to a dense mesh reactivates its existing buffers without another upload.
+- Material texture changes now leave the connected procedural mesh and its GPU buffers untouched. A real upstream geometry edit invalidates only that geometry branch and uploads the replacement mesh once.
+- Auto wireframe inspection now yields to interactivity above 250,000 triangles instead of constructing a potentially enormous unique-edge buffer. The viewport status reports when this protection is active; Wireframe Always remains an explicit override.
+- Extended GPU / Renderer Diagnostics with procedural-geometry CPU and GPU cache entries, memory use and budgets. Clear Render Cache and cache-budget controls now include geometry results and resident mesh buffers.
+- Added a focused geometry-cache performance regression covering unrelated Material edits, true geometry invalidation, stable mesh identity and resident GPU buffer reactivation.
+- Graph format remains version 18 and the application node count remains **173 node types**.
+
 ## 0.49.0 — Geometry Toolkit Foundation
 
 - Added **Geometry Transform** with Translate X/Y/Z, pivot-based Rotation X/Y/Z, Uniform and per-axis Scale, and Current Origin / Bounds Centre transform modes. Non-uniform scale uses the correct inverse normal transform and mirrored scales automatically repair triangle winding.
