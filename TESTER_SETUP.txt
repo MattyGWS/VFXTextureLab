@@ -1,0 +1,47 @@
+VFX TEXTURE LAB 0.38.0 - SOURCE TESTING SETUP
+================================================
+
+This is a development/testing copy, not a finished installed application.
+Do not run it directly from inside the ZIP. Extract the entire folder first.
+An internet connection is required during the first setup.
+
+WINDOWS
+-------
+1. Install a current 64-bit Python 3 release (Python 3.11 or newer).
+   During installation, enable "Add python.exe to PATH" and install the
+   Python launcher when those options are shown.
+2. Extract the entire VFX Texture Lab ZIP to an ordinary folder.
+3. Double-click setup.bat.
+4. Wait for "Setup completed successfully".
+5. Double-click run.bat whenever you want to launch VFX Texture Lab.
+
+The setup script creates a private .venv folder and downloads the required
+Python packages. It does not change the Python packages used by other apps.
+
+LINUX
+-----
+1. Install Python 3.11 or newer, pip, and virtual-environment support.
+2. Extract the entire archive and open a terminal in its folder.
+3. Run:
+
+       bash setup.sh
+
+4. After setup succeeds, launch with:
+
+       ./run.sh
+
+   If executable permissions were lost while extracting, use:
+
+       bash run.sh
+
+UPDATES
+-------
+For another source-testing version, extract it to a new folder and run the
+matching setup script again. Do not copy a .venv folder between computers,
+between Linux and Windows, or between substantially different Python versions.
+
+TROUBLESHOOTING
+---------------
+Keep graphics drivers reasonably current. The GPU renderer uses WebGPU through
+wgpu-py. If setup or startup fails, copy or screenshot the complete terminal or
+Command Prompt output and send it with the report.

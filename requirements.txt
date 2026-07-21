@@ -1,0 +1,5 @@
+PySide6>=6.8,<7
+numpy>=2.0,<3
+Pillow>=10,<13
+wgpu>=0.31,<0.32
+rendercanvas>=2.4,<3

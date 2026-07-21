@@ -1,0 +1,11 @@
+VFX Texture Lab 0.11.1 update
+
+Copy the contents of this folder into an existing VFXTextureLab 0.11.0
+folder and overwrite matching files. No new dependencies are required.
+
+Run normally afterward:
+  ./run.sh
+
+Focused validation:
+  .venv/bin/python tests/noise_quality_test.py
+  .venv/bin/python tests/noise_foundation_test.py

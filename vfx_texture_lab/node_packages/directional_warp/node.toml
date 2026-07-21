@@ -1,0 +1,63 @@
+api_version = 2
+id = "org.vfxtexturelab.directional_warp"
+name = "Directional Warp"
+version = "1.0.0"
+category = "Distortion"
+description = "Offsets an image along a chosen direction using a greyscale intensity map. Seamless wrapping is enabled by default."
+accent = "#b15e78"
+tags = ["warp", "distort", "offset", "direction", "flow"]
+shader = "kernel.wgsl"
+icon = "icon.svg"
+output_format = "rgba16f"
+output_name = "Image"
+output_kind = "image_any"
+format_policy = "preserve_first"
+
+[[inputs]]
+name = "Image"
+type = "image_any"
+default = "black"
+
+[[inputs]]
+name = "Intensity"
+type = "grayscale"
+default = "black"
+
+[[parameters]]
+id = "strength"
+name = "Strength"
+type = "float"
+default = 0.08
+minimum = -1.0
+maximum = 1.0
+step = 0.005
+animatable = true
+
+[[parameters]]
+id = "angle"
+name = "Angle"
+type = "float"
+default = 0.0
+minimum = -360.0
+maximum = 360.0
+step = 1.0
+slider_minimum = -180.0
+slider_maximum = 180.0
+fine_step = 1.0
+coarse_step = 5.0
+editor = "angle"
+unit = "degrees"
+animatable = true
+
+[[parameters]]
+id = "centered"
+name = "Centred Intensity"
+type = "bool"
+default = true
+description = "Treat 0.5 as zero displacement; otherwise black is zero and white is full displacement."
+
+[[parameters]]
+id = "wrap"
+name = "Wrap"
+type = "bool"
+default = true

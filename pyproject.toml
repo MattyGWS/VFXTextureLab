@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfx-texture-lab"
+version = "0.49.0"
+description = "A focused, node-based procedural texture tool for VFX artists."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Matty Wyett-Simmonds and contributors"}]
+dependencies = [
+    "PySide6>=6.8,<7",
+    "numpy>=2.0,<3",
+    "Pillow>=10,<13",
+    "wgpu>=0.31,<0.32",
+    "rendercanvas>=2.4,<3",
+]
+
+[project.scripts]
+vfx-texture-lab = "vfx_texture_lab.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["vfx_texture_lab*"]
+
+[tool.setuptools.package-data]
+"vfx_texture_lab.shaders" = ["**/*.wgsl"]
+"vfx_texture_lab.assets.environments" = ["**/*.npz", "**/*.md"]
+"vfx_texture_lab.node_packages" = ["**/*.toml", "**/*.wgsl", "**/*.svg", "**/*.md"]

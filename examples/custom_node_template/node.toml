@@ -1,0 +1,49 @@
+api_version = 2
+id = "com.example.sine_waves"
+name = "Sine Waves"
+version = "1.0.0"
+category = "Patterns"
+description = "A simple seamless scalar pattern demonstrating the public node API. Change the permanent ID before sharing."
+accent = "#6876df"
+tags = ["template", "sine", "wave", "stripe"]
+shader = "kernel.wgsl"
+output_format = "r16f"
+output_name = "Value"
+output_kind = "grayscale"
+format_policy = "declared"
+
+[[parameters]]
+id = "frequency"
+name = "Frequency"
+type = "float"
+default = 8.0
+minimum = 1.0
+maximum = 64.0
+step = 0.25
+animatable = true
+
+[[parameters]]
+id = "angle"
+name = "Angle"
+type = "float"
+default = 0.0
+minimum = -360.0
+maximum = 360.0
+step = 1.0
+slider_minimum = -180.0
+slider_maximum = 180.0
+fine_step = 1.0
+coarse_step = 5.0
+editor = "angle"
+unit = "degrees"
+animatable = true
+
+[[parameters]]
+id = "phase"
+name = "Phase"
+type = "float"
+default = 0.0
+minimum = -1.0
+maximum = 1.0
+step = 0.01
+animatable = true

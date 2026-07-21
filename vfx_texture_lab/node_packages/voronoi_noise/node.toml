@@ -1,0 +1,152 @@
+api_version = 2
+id = "org.vfxtexturelab.voronoi_noise"
+name = "Voronoi Noise"
+version = "2.1.0"
+category = "Noise"
+description = "Production-ready seamless Voronoi noise with loopable feature-point motion and distinct distance, edge, cell-value and F2-F1 outputs. Authored through the public WGSL package API."
+accent = "#4fa6a3"
+tags = ["voronoi", "cellular", "cells", "distance", "tiling", "loop"]
+shader = "kernel.wgsl"
+icon = "icon.svg"
+output_format = "r16f"
+output_name = "Distance"
+output_kind = "grayscale"
+format_policy = "declared"
+output_parameter = "mode"
+
+[[outputs]]
+name = "Distance"
+kind = "grayscale"
+value = "Distance"
+
+[[outputs]]
+name = "Edge"
+kind = "grayscale"
+value = "Edge"
+
+[[outputs]]
+name = "Cell Value"
+kind = "grayscale"
+value = "Cell Value"
+
+[[outputs]]
+name = "F2 - F1"
+kind = "grayscale"
+value = "F2 - F1"
+
+[[parameters]]
+id = "scale"
+name = "Scale"
+type = "float"
+default = 8.0
+minimum = 1.0
+maximum = 128.0
+step = 1.0
+animatable = true
+description = "Whole repeating cells across the texture."
+
+[[parameters]]
+id = "seed"
+name = "Seed"
+type = "int"
+default = 1
+minimum = 0
+maximum = 999999
+step = 1
+animatable = true
+
+[[parameters]]
+id = "jitter"
+name = "Jitter"
+type = "float"
+default = 1.0
+minimum = 0.0
+maximum = 1.0
+step = 0.01
+animatable = true
+description = "Orbit radius of each feature point inside its cell."
+
+[[parameters]]
+id = "evolution"
+name = "Evolution"
+type = "float"
+default = 0.0
+minimum = 0.0
+maximum = 1.0
+step = 0.001
+animatable = true
+description = "Normalised loop phase. Connect Loop Phase directly; 0 and 1 match at one loop cycle."
+
+[[parameters]]
+id = "loop_cycles"
+name = "Loop Cycles"
+type = "float"
+default = 1.0
+minimum = 0.25
+maximum = 16.0
+step = 0.25
+animatable = true
+
+[[parameters]]
+id = "distance_metric"
+name = "Distance Metric"
+type = "enum"
+default = "Euclidean"
+options = ["Euclidean", "Manhattan", "Chebyshev", "Minkowski"]
+
+[[parameters]]
+id = "distance_exponent"
+name = "Minkowski Exponent"
+type = "float"
+default = 2.0
+minimum = 0.25
+maximum = 8.0
+step = 0.05
+animatable = true
+
+[[parameters]]
+id = "edge_width"
+name = "Edge Width"
+type = "float"
+default = 0.08
+minimum = 0.0
+maximum = 0.5
+step = 0.001
+animatable = true
+
+[[parameters]]
+id = "edge_softness"
+name = "Edge Softness"
+type = "float"
+default = 0.02
+minimum = 0.0001
+maximum = 0.5
+step = 0.001
+animatable = true
+
+[[parameters]]
+id = "contrast"
+name = "Contrast"
+type = "float"
+default = 1.0
+minimum = 0.05
+maximum = 8.0
+step = 0.05
+animatable = true
+
+[[parameters]]
+id = "balance"
+name = "Balance"
+type = "float"
+default = 0.0
+minimum = -1.0
+maximum = 1.0
+step = 0.01
+animatable = true
+
+[[parameters]]
+id = "mode"
+name = "Preview Output"
+type = "enum"
+default = "Distance"
+options = ["Distance", "Edge", "Cell Value", "F2 - F1"]

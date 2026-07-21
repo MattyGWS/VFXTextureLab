@@ -1,0 +1,13 @@
+{
+  "id": "forest-night",
+  "name": "Forest Night",
+  "base": "graphite",
+  "colors": {
+    "accent": "#56b870",
+    "accent_hover": "#72cc8a",
+    "selection": "#355b43",
+    "progress": "#e7a23d",
+    "scrollbar_handle": "#607566",
+    "scrollbar_hover": "#799481"
+  }
+}

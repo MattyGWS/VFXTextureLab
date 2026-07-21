@@ -1,0 +1,77 @@
+api_version = 2
+id = "org.vfxtexturelab.polar_coordinates"
+name = "Polar Coordinates"
+version = "1.0.0"
+category = "Coordinates"
+description = "Maps a rectangular texture around a configurable centre for shockwaves, radial wipes, rings and circular VFX."
+accent = "#8a5cc7"
+tags = ["polar", "radial", "coordinates", "ring", "shockwave"]
+shader = "kernel.wgsl"
+icon = "icon.svg"
+output_format = "rgba16f"
+output_name = "Image"
+output_kind = "image_any"
+format_policy = "preserve_first"
+
+[[inputs]]
+name = "Image"
+type = "image_any"
+default = "black"
+
+[[parameters]]
+id = "center_x"
+name = "Centre X"
+type = "float"
+default = 0.5
+minimum = 0.0
+maximum = 1.0
+step = 0.01
+animatable = true
+
+[[parameters]]
+id = "center_y"
+name = "Centre Y"
+type = "float"
+default = 0.5
+minimum = 0.0
+maximum = 1.0
+step = 0.01
+animatable = true
+
+[[parameters]]
+id = "radius_scale"
+name = "Radius Scale"
+type = "float"
+default = 1.0
+minimum = 0.01
+maximum = 4.0
+step = 0.01
+animatable = true
+
+[[parameters]]
+id = "angle_offset"
+name = "Angle Offset"
+type = "float"
+default = 0.0
+minimum = -360.0
+maximum = 360.0
+step = 1.0
+slider_minimum = -180.0
+slider_maximum = 180.0
+fine_step = 1.0
+coarse_step = 5.0
+editor = "angle"
+unit = "degrees"
+animatable = true
+
+[[parameters]]
+id = "clockwise"
+name = "Clockwise"
+type = "bool"
+default = true
+
+[[parameters]]
+id = "wrap"
+name = "Wrap Source"
+type = "bool"
+default = true
