@@ -119,33 +119,64 @@ jobs:
       - name: Test installed application
         shell: pwsh
         run: |
+          function Invoke-CheckedProcess {
+            param(
+              [Parameter(Mandatory = $true)][string] $FilePath,
+              [string[]] $ArgumentList = @(),
+              [Parameter(Mandatory = $true)][string] $Description
+            )
+
+            # The installer, frozen application, and uninstaller are Windows GUI
+            # executables. Invoking them with '&' does not reliably wait for them
+            # or populate $LASTEXITCODE on GitHub's PowerShell runner.
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $FilePath
+            $startInfo.UseShellExecute = $false
+            foreach ($argument in $ArgumentList) {
+              [void] $startInfo.ArgumentList.Add($argument)
+            }
+
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            if ($null -eq $process) {
+              throw "Failed to start $Description."
+            }
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+              throw "$Description failed with exit code $($process.ExitCode)."
+            }
+          }
+
           $installer = (Resolve-Path "build/inno/${{ steps.metadata.outputs.installer_filename }}").Path
           $installDir = Join-Path $env:RUNNER_TEMP "VFX Texture Lab Installer Test"
           Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
 
-          & $installer '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Installer smoke test failed with exit code $LASTEXITCODE."
-          }
+          Invoke-CheckedProcess `
+            -FilePath $installer `
+            -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir") `
+            -Description 'Installer smoke test'
 
           $installedExe = Join-Path $installDir "VFX Texture Lab.exe"
           if (-not (Test-Path $installedExe)) {
             throw "Installer did not create $installedExe"
           }
           $smokeReport = Join-Path (Resolve-Path build).Path "installed-smoke.json"
-          & $installedExe '--package-smoke-test' '--require-frozen' '--json' $smokeReport
-          if ($LASTEXITCODE -ne 0) {
-            throw "Installed application smoke test failed with exit code $LASTEXITCODE."
+          Invoke-CheckedProcess `
+            -FilePath $installedExe `
+            -ArgumentList @('--package-smoke-test', '--require-frozen', '--json', $smokeReport) `
+            -Description 'Installed application smoke test'
+
+          if (-not (Test-Path $smokeReport)) {
+            throw "Installed application did not create its smoke-test report."
           }
 
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (-not (Test-Path $uninstaller)) {
             throw "Installer did not create its uninstaller."
           }
-          & $uninstaller '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
-          if ($LASTEXITCODE -ne 0) {
-            throw "Uninstaller smoke test failed with exit code $LASTEXITCODE."
-          }
+          Invoke-CheckedProcess `
+            -FilePath $uninstaller `
+            -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') `
+            -Description 'Uninstaller smoke test'
 
       - name: Create portable ZIP and checksums
         shell: pwsh
