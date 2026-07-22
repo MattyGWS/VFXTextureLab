@@ -12,7 +12,9 @@ from PySide6.QtWidgets import QApplication
 
 from vfx_texture_lab.engine.evaluator import GraphEvaluator
 from vfx_texture_lab.graph.scene import GraphScene
+from vfx_texture_lab.nodes.image_ops import srgb_to_linear
 from vfx_texture_lab.nodes.registry import build_registry
+from vfx_texture_lab.ui.preview import array_to_qimage
 
 
 def main() -> None:
@@ -25,7 +27,9 @@ def main() -> None:
     split = scene.create_node("convert.extract_channel", QPointF(250, 0), record_undo=False)
     output = scene.create_node("output.image", QPointF(500, 0), record_undo=False)
     scene.add_connection(colour.output_port, split.input_ports["Image"], record_undo=False)
-    expected = {"R": 0x20 / 255, "G": 0x40 / 255, "B": 0x80 / 255, "A": 0xC0 / 255}
+    display_rgb = np.array([0x20, 0x40, 0x80], dtype=np.float32) / np.float32(255.0)
+    linear_rgb = srgb_to_linear(display_rgb)
+    expected = {"R": linear_rgb[0], "G": linear_rgb[1], "B": linear_rgb[2], "A": 0xC0 / 255}
     for name, value in expected.items():
         for connection in list(scene.connections):
             if connection.target_node is output:
@@ -34,6 +38,13 @@ def main() -> None:
         result = GraphEvaluator(scene, backend_preference="cpu").evaluate(output.uid, 8, 8)
         assert result.error is None, result.error
         assert abs(float(result.image[0, 0, 0]) - value) < 1e-5
+
+    # The graph stores linear-light RGB, but the preview must round-trip to the
+    # exact display-sRGB colour selected in the parameter editor.
+    colour_result = GraphEvaluator(scene, backend_preference="cpu").evaluate(colour.uid, 8, 8)
+    preview = array_to_qimage(colour_result.image, "color")
+    pixel = preview.pixelColor(0, 0)
+    assert (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()) == (0x20, 0x40, 0x80, 0xC0)
 
     gradient = registry.get("convert.gradient_map")
     defaults = gradient.default_parameters()["stops"]

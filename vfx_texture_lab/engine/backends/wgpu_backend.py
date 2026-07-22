@@ -18,7 +18,7 @@ except ImportError as exc:  # pragma: no cover - exercised by CPU-only installs.
     raise RuntimeError("wgpu-py is not installed") from exc
 
 from ...nodes.base import EvalContext, NodeDefinition
-from ...nodes.image_ops import parse_hex_color, relative_pixels, resolution_scale
+from ...nodes.image_ops import parse_hex_color, relative_pixels, resolution_scale, srgb_to_linear
 from ...nodes.generators import geometric_raster_feather, tile_sampler_candidate_radius
 from ...nodes.distance import _jump_steps
 from ...nodes.photogrammetry import quad_homography
@@ -2574,7 +2574,9 @@ class WgpuBackend(RenderBackend):
         if type_id == "generator.constant":
             return self._pack_params(context, (float(parameters.get("value", 0.5)), 0.0, 0.0, 0.0))
         if type_id == "generator.color":
-            color = tuple(float(value) for value in parse_hex_color(str(parameters.get("color", "#ffffffff"))))
+            color_values = parse_hex_color(str(parameters.get("color", "#ffffffff")))
+            color_values[:3] = srgb_to_linear(color_values[:3])
+            color = tuple(float(value) for value in color_values)
             return self._pack_params(context, color)  # type: ignore[arg-type]
         if type_id == "generator.linear_gradient":
             return self._pack_params(context, (

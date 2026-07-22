@@ -25,6 +25,23 @@ No tag or GitHub Release is created. Workflow artifacts are retained for 14 days
 
 ## Draft a public release
 
+The normal maintainer path from Linux is the guarded one-command script:
+
+```bash
+./tools/publish_windows_release.sh
+```
+
+Before running it, set the same new version in `pyproject.toml` and
+`vfx_texture_lab/__init__.py`, then add a matching `## <version>` section to
+`CHANGELOG.md`. The script shows all pending files, commits them as
+`Release <version>`, pushes `main`, starts the draft-release workflow, waits for
+the Windows build and installer smoke tests, verifies all three release assets,
+then asks once more before making the release public.
+
+Use `--yes` only when an unattended publication is genuinely intended.
+
+The equivalent manual route is:
+
 1. Set the same version in `pyproject.toml` and `vfx_texture_lab/__init__.py`.
 2. Add a matching `## <version>` section to `CHANGELOG.md`.
 3. Push the final commit.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vfx-texture-lab"
-version = "0.50.0"
+version = "0.50.1"
 description = "A node-based procedural texture, material and geometry authoring tool for VFX artists."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -7,7 +7,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from .base import EvalContext, ImageArray, NodeDefinition, ParameterSpec
-from .image_ops import grayscale_rgba, parse_hex_color
+from .image_ops import grayscale_rgba, parse_hex_color, srgb_to_linear
 from .registry import NodeRegistry
 
 
@@ -31,6 +31,10 @@ def eval_constant(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], 
 
 def eval_color(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], context: EvalContext) -> ImageArray:
     color = parse_hex_color(str(params["color"]))
+    # Colour parameters are authored through Qt's display-sRGB picker, while
+    # colour image data inside the graph is stored in linear light. Convert RGB
+    # exactly once here and leave alpha as linear coverage.
+    color[:3] = srgb_to_linear(color[:3])
     return np.broadcast_to(color, (context.height, context.width, 4)).copy()
 
 

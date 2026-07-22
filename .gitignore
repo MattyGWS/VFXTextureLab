@@ -1,16 +1,28 @@
 __pycache__/
 *.py[cod]
+
 .venv/
 venv/
 .env
+
 .pytest_cache/
 *.egg-info/
-build/
-dist/
+
 *.vfxgraph
 
-# Windows packaging output
+# Local build output
 /build/
 /dist/
 /release/
 packaging/windows/generated_version_info.txt
+
+# Downloaded GitHub Actions artefacts
+/VFXTextureLab-*-Windows-x64/
+/windows-build-diagnostics-*/
+
+# Temporary Windows build failure reports
+/windows-build-failure.txt
+/windows-build-failure.zip
+
+# Local packaging patches
+/VFXTextureLab-*-Windows-Packaging*.patch

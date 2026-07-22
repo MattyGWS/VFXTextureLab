@@ -8223,7 +8223,7 @@ class MainWindow(QMainWindow):
             "About VFX Texture Lab",
             f"<b>VFX Texture Lab {__version__}</b><br><br>"
             "A focused, open-source procedural texture graph for VFX artists.<br><br>"
-            "0.50.0 adds VFX Ribbon generation plus Bend, Twist, UV Transform and seam-aware Geometry Clean / Weld operations.",
+            "0.50.1 adds automated Windows packages and correct display-sRGB colour authoring for the Colour generator.",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
