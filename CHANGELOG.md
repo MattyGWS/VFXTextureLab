@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — Automated Windows Distribution
+
+- Added a automated GitHub Actions Windows x64 pipeline that builds the application on a clean Windows runner from Linux-authored source.
+- Added a PyInstaller one-folder specification with preserved WGSL, environment-map and built-in node-package resources plus explicit rendercanvas and wgpu backend collection.
+- Added an Inno Setup per-user installer with uninstall support, optional desktop shortcut and `.vfxgraph`, `.vfxpackage`, `.vfxexport` and `.vfxnodepkg` file associations.
+- Added automated portable ZIP, installer and SHA-256 asset generation, 14-day workflow artifacts, and optional draft GitHub Release creation from the project version and changelog.
+- Added source, frozen-executable and installed-application package smoke tests covering dependencies, wgpu-native, Qt's Windows platform plugin, shader/resource counts, environment archives, bundled node manifests and the complete built-in node registry.
+- Added embedded Windows version metadata, application/taskbar icons and detailed maintainer documentation in `docs/WINDOWS_RELEASES.md`.
+
 ## 0.50.0 — VFX Geometry Shaping
 
 - Added **Geometry Ribbon**, generating straight or tapered segmented strips with three base orientations, shared Origin/XYZ Rotation controls and integer U/V tiling. U runs across width and V along length for predictable beams, trails, slashes and scrolling effects.
@@ -1081,6 +1090,15 @@
 - Accurate linear-frequency histogram rendering from 0.18.8 remains the shared display model across histogram-driven editors.
 
 # Changelog
+
+## Unreleased — Automated Windows Distribution
+
+- Added a automated GitHub Actions Windows x64 pipeline that builds the application on a clean Windows runner from Linux-authored source.
+- Added a PyInstaller one-folder specification with preserved WGSL, environment-map and built-in node-package resources plus explicit rendercanvas and wgpu backend collection.
+- Added an Inno Setup per-user installer with uninstall support, optional desktop shortcut and `.vfxgraph`, `.vfxpackage`, `.vfxexport` and `.vfxnodepkg` file associations.
+- Added automated portable ZIP, installer and SHA-256 asset generation, 14-day workflow artifacts, and optional draft GitHub Release creation from the project version and changelog.
+- Added source, frozen-executable and installed-application package smoke tests covering dependencies, wgpu-native, Qt's Windows platform plugin, shader/resource counts, environment archives, bundled node manifests and the complete built-in node registry.
+- Added embedded Windows version metadata, application/taskbar icons and detailed maintainer documentation in `docs/WINDOWS_RELEASES.md`.
 
 ## 0.18.8 — Accurate shared histogram display
 

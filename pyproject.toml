@@ -25,6 +25,7 @@ vfx-texture-lab = "vfx_texture_lab.__main__:main"
 include = ["vfx_texture_lab*"]
 
 [tool.setuptools.package-data]
+"vfx_texture_lab.assets" = ["*.png"]
 "vfx_texture_lab.shaders" = ["**/*.wgsl"]
 "vfx_texture_lab.assets.environments" = ["**/*.npz", "**/*.md"]
 "vfx_texture_lab.node_packages" = ["**/*.toml", "**/*.wgsl", "**/*.svg", "**/*.md"]

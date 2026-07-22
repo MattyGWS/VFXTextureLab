@@ -1,0 +1,221 @@
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should happen after a successful build?
+        required: true
+        type: choice
+        default: test-build
+        options:
+          - test-build
+          - draft-release
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      RELEASE_MODE: ${{ github.event_name == 'push' && 'draft-release' || inputs.mode }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install "pyinstaller>=6.15,<7"
+
+      - name: Prepare release metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build, dist, release | Out-Null
+          python tools/windows_release.py prepare `
+            --version-info packaging/windows/generated_version_info.txt `
+            --release-notes build/release-notes.md `
+            --metadata-json build/release-metadata.json `
+            --github-output $env:GITHUB_OUTPUT
+
+      - name: Validate tag and version
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $expected = "${{ steps.metadata.outputs.tag }}"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match pyproject.toml version $expected."
+          }
+
+      - name: Run source package smoke test
+        shell: pwsh
+        run: |
+          python -m vfx_texture_lab --package-smoke-test --json build/source-smoke.json
+
+      - name: Build frozen application
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean packaging/windows/VFXTextureLab.spec
+
+      - name: Verify frozen application
+        shell: pwsh
+        run: |
+          python tools/windows_release.py verify `
+            --dist "dist/VFX Texture Lab" `
+            --smoke-json build/frozen-smoke.json
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $candidates = @(
+            Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue
+            Get-ChildItem "${env:ProgramFiles}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue
+          ) | Sort-Object FullName -Descending
+          $iscc = $candidates | Select-Object -First 1
+          if ($null -eq $iscc) {
+            throw "Inno Setup compiler was not found after installation."
+          }
+          "ISCC_PATH=$($iscc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          VFXTL_VERSION: ${{ steps.metadata.outputs.version }}
+          VFXTL_WINDOWS_VERSION: ${{ steps.metadata.outputs.windows_version }}
+          VFXTL_SOURCE_DIR: ${{ github.workspace }}\dist\VFX Texture Lab
+          VFXTL_OUTPUT_DIR: ${{ github.workspace }}\build\inno
+          VFXTL_INSTALLER_BASENAME: ${{ steps.metadata.outputs.asset_stem }}-Setup
+        run: |
+          New-Item -ItemType Directory -Force $env:VFXTL_OUTPUT_DIR | Out-Null
+          & $env:ISCC_PATH "packaging/windows/VFXTextureLab.iss"
+
+      - name: Test installed application
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "build/inno/${{ steps.metadata.outputs.installer_filename }}").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "VFX Texture Lab Installer Test"
+          Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          & $installer '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installer smoke test failed with exit code $LASTEXITCODE."
+          }
+
+          $installedExe = Join-Path $installDir "VFX Texture Lab.exe"
+          if (-not (Test-Path $installedExe)) {
+            throw "Installer did not create $installedExe"
+          }
+          $smokeReport = Join-Path (Resolve-Path build).Path "installed-smoke.json"
+          & $installedExe '--package-smoke-test' '--require-frozen' '--json' $smokeReport
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed application smoke test failed with exit code $LASTEXITCODE."
+          }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path $uninstaller)) {
+            throw "Installer did not create its uninstaller."
+          }
+          & $uninstaller '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Uninstaller smoke test failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Create portable ZIP and checksums
+        shell: pwsh
+        run: |
+          python tools/windows_release.py package `
+            --dist "dist/VFX Texture Lab" `
+            --installer "build/inno/${{ steps.metadata.outputs.installer_filename }}" `
+            --release-dir release
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            release/${{ steps.metadata.outputs.portable_filename }}
+            release/${{ steps.metadata.outputs.installer_filename }}
+            release/${{ steps.metadata.outputs.checksum_filename }}
+            build/source-smoke.json
+            build/frozen-smoke.json
+            build/installed-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-build-diagnostics-${{ github.run_number }}
+          path: |
+            build/source-smoke.json
+            build/frozen-smoke.json
+            build/installed-smoke.json
+            build/VFXTextureLab/warn-*.txt
+            build/VFXTextureLab/xref-*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Create or update draft GitHub Release
+        if: env.RELEASE_MODE == 'draft-release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          PORTABLE: release/${{ steps.metadata.outputs.portable_filename }}
+          INSTALLER: release/${{ steps.metadata.outputs.installer_filename }}
+          CHECKSUMS: release/${{ steps.metadata.outputs.checksum_filename }}
+        run: |
+          git fetch --tags --force
+          $tagText = (git tag --list $env:RELEASE_TAG | Out-String).Trim()
+          $tagExists = -not [string]::IsNullOrWhiteSpace($tagText)
+          if ($tagExists) {
+            $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+            if ($tagCommit -ne $env:GITHUB_SHA) {
+              throw "Existing tag $env:RELEASE_TAG points to $tagCommit, not this build's $env:GITHUB_SHA."
+            }
+          }
+
+          gh release view $env:RELEASE_TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $env:PORTABLE $env:INSTALLER $env:CHECKSUMS --clobber
+            gh release edit $env:RELEASE_TAG `
+              --draft `
+              --title "VFX Texture Lab $env:RELEASE_VERSION" `
+              --notes-file build/release-notes.md
+          } else {
+            gh release create $env:RELEASE_TAG `
+              $env:PORTABLE $env:INSTALLER $env:CHECKSUMS `
+              --draft `
+              --target $env:GITHUB_SHA `
+              --title "VFX Texture Lab $env:RELEASE_VERSION" `
+              --notes-file build/release-notes.md
+          }

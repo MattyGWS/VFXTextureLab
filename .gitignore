@@ -8,3 +8,9 @@ venv/
 build/
 dist/
 *.vfxgraph
+
+# Windows packaging output
+/build/
+/dist/
+/release/
+packaging/windows/generated_version_info.txt

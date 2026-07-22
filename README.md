@@ -4,7 +4,7 @@
 
 It is designed for artists who want the flexibility of a procedural graph without forcing a conventional material-only workflow. The same project can generate masks, noises, distortions, normal and height data, animated effects, complete texture sets and the mesh used to preview or export them.
 
-> VFX Texture Lab is in active development. Current source-testing builds target Linux and Windows and may intentionally change graph behaviour while major systems are still being established.
+> VFX Texture Lab is in active public-beta development. Automated Windows x64 builds are published through GitHub Releases; Linux and contributor workflows remain source-based for now. Graph behaviour may still change while major systems are being established.
 
 ![VFX Texture Lab workspace](docs/application-layout.png)
 
@@ -145,27 +145,24 @@ The Inspector and GPU/Renderer Diagnostics expose timing and cache information w
 
 Graph assets can be linked for live library updates or embedded for portability. Self-contained export recursively embeds reachable graph instances and image sources required to reproduce the result.
 
-## Source-testing setup
-
-These archives are development copies rather than finished installers. Extract the complete folder before running the setup scripts.
+## Installation
 
 ### Windows
 
-1. Install 64-bit Python 3.11 or newer and enable **Add Python to PATH**.
-2. Extract the source archive.
-3. Run `setup.bat` once.
-4. Launch with `run.bat`.
+Download either the **Windows x64 Setup** installer or **Windows x64 Portable** ZIP from the GitHub Releases page. The installer does not require Python, creates normal Start Menu/uninstall entries, and associates VFX Texture Lab project/package formats with the application.
 
-### Linux
+The first public builds are unsigned, so Microsoft Defender SmartScreen may ask for confirmation before launch. Verify that the file came from this repository's official Releases page and use the published SHA-256 file when needed.
 
-Install Python 3.11 or newer with pip and virtual-environment support, then run:
+### Running from source
+
+Source testing remains available on Windows and Linux for contributors. Install Python 3.11 or newer, extract or clone the complete repository, then run `setup.bat` / `run.bat` on Windows or:
 
 ```bash
 bash setup.sh
 ./run.sh
 ```
 
-The setup scripts create a private `.venv` inside the extracted folder. Do not copy that environment between operating systems or unrelated Python versions.
+The setup scripts create a private `.venv` inside the project folder. Do not copy that environment between operating systems or unrelated Python versions.
 
 A reasonably current graphics driver is recommended. GPU rendering and compute use WebGPU through `wgpu-py`; exact feature availability depends on the graphics adapter and driver.
 
@@ -182,12 +179,13 @@ Detailed subsystem documentation is available in [`docs/`](docs/), including:
 - [`GRAPH_ASSETS.md`](docs/GRAPH_ASSETS.md)
 - [`EXPORTING.md`](docs/EXPORTING.md)
 - [`SIMULATIONS.md`](docs/SIMULATIONS.md)
+- [`WINDOWS_RELEASES.md`](docs/WINDOWS_RELEASES.md)
 
 Release notes are maintained exclusively in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Development status
 
-The project is currently distributed as source-testing builds while its feature set, graph schema and packaging workflow mature. Bug reports are most useful when they include:
+The project is in public beta. Windows x64 binaries are built automatically by GitHub Actions, while source testing remains available on Windows and Linux. Bug reports are most useful when they include:
 
 - The application version
 - Operating system and graphics hardware
