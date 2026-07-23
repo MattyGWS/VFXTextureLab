@@ -47,6 +47,8 @@ class WgpuBackend(RenderBackend):
         "generator.constant": "constant.wgsl",
         "generator.color": "color.wgsl",
         "generator.linear_gradient": "linear_gradient.wgsl",
+        "generator.linear_gradient_2": "linear_gradient.wgsl",
+        "generator.linear_gradient_3": "linear_gradient.wgsl",
         "generator.radial_gradient": "radial_gradient.wgsl",
         "shape.shape": "shape.wgsl",
         "shape.polygon": "polygon.wgsl",
@@ -212,6 +214,8 @@ class WgpuBackend(RenderBackend):
         "generator.constant": (),
         "generator.color": (),
         "generator.linear_gradient": (),
+        "generator.linear_gradient_2": (),
+        "generator.linear_gradient_3": (),
         "generator.radial_gradient": (),
         "shape.shape": (),
         "shape.polygon": (),
@@ -2578,12 +2582,22 @@ class WgpuBackend(RenderBackend):
             color_values[:3] = srgb_to_linear(color_values[:3])
             color = tuple(float(value) for value in color_values)
             return self._pack_params(context, color)  # type: ignore[arg-type]
-        if type_id == "generator.linear_gradient":
+        if type_id in {
+            "generator.linear_gradient",
+            "generator.linear_gradient_2",
+            "generator.linear_gradient_3",
+        }:
+            variants = {
+                "generator.linear_gradient": 0.0,
+                "generator.linear_gradient_2": 1.0,
+                "generator.linear_gradient_3": 2.0,
+            }
+            default_angle = 0.0 if type_id == "generator.linear_gradient" else 90.0
             return self._pack_params(context, (
-                float(parameters.get("angle", 0.0)),
+                float(parameters.get("angle", default_angle)),
                 float(parameters.get("offset", 0.0)),
                 flag(parameters.get("repeat", True)),
-                0.0,
+                variants[type_id],
             ))
         if type_id == "generator.radial_gradient":
             return self._pack_params(context, (

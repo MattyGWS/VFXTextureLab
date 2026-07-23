@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .graph_assets import GRAPH_ASSET_FORMAT, GRAPH_INSTANCE_TYPE, source_revision
+from .graph_resources import GraphResourceLibrary, migrate_project_resources
 
 
 class SelfContainedGraphError(ValueError):
@@ -24,21 +25,27 @@ class SelfContainedGraphError(ValueError):
 class SelfContainedExportReport:
     graph_instances: int = 0
     images: int = 0
+    meshes: int = 0
     recovered_graphs: int = 0
     recovered_images: int = 0
+    recovered_meshes: int = 0
     already_embedded_graphs: int = 0
     already_embedded_images: int = 0
+    already_embedded_meshes: int = 0
     warnings: list[str] = field(default_factory=list)
 
     def summary_lines(self) -> list[str]:
         lines = [
             f"Nested graph instances embedded: {self.graph_instances}",
             f"Images embedded: {self.images}",
+            f"Meshes embedded: {self.meshes}",
         ]
         if self.recovered_graphs:
             lines.append(f"Graph sources recovered from cached revisions: {self.recovered_graphs}")
         if self.recovered_images:
             lines.append(f"Images recovered from embedded bytes: {self.recovered_images}")
+        if self.recovered_meshes:
+            lines.append(f"Meshes recovered from embedded bytes: {self.recovered_meshes}")
         return lines
 
 
@@ -68,7 +75,9 @@ def _graph_label(data: Mapping[str, Any], fallback: str = "Graph") -> str:
     return str(fallback or "Graph")
 
 
-def _decode_embedded_image(parameters: Mapping[str, Any], *, chain: list[str]) -> bytes | None:
+def _decode_embedded_resource(
+    parameters: Mapping[str, Any], *, chain: list[str], label: str = "resource"
+) -> bytes | None:
     encoded = str(parameters.get("_embedded_data", "") or "").strip()
     if not encoded:
         return None
@@ -76,7 +85,7 @@ def _decode_embedded_image(parameters: Mapping[str, Any], *, chain: list[str]) -
         return base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise SelfContainedGraphError(
-            "The stored embedded image data is damaged and cannot be decoded.", chain=chain
+            f"The stored embedded {label} data is damaged and cannot be decoded.", chain=chain
         ) from exc
 
 
@@ -186,6 +195,10 @@ def _embed_graph(
         raise SelfContainedGraphError(
             "This data is not a VFX Texture Lab graph.", chain=chain
         )
+    # Format 19 may compact embedded payloads into graph-owned resources.
+    # Hydrate the node parameters before traversing the established portable
+    # graph logic, which also keeps older format graphs fully compatible.
+    migrate_project_resources(result)
     key = _source_key(result, owner_path)
     if key in ancestry:
         raise SelfContainedGraphError(
@@ -253,59 +266,86 @@ def _embed_graph(
                 parameters.pop("_asset_recovered_from_cache", None)
             continue
 
-        if type_id != "input.image":
+        if type_id not in {"input.image", "input.mesh"}:
             continue
 
-        report.images += 1
+        is_mesh = type_id == "input.mesh"
+        label = "mesh" if is_mesh else "image"
+        if is_mesh:
+            report.meshes += 1
+        else:
+            report.images += 1
         path_text = str(parameters.get("path", "") or "").strip()
-        embedded_bytes = _decode_embedded_image(parameters, chain=node_chain)
-        image_bytes: bytes | None = None
-        image_name = str(parameters.get("_embedded_name", "") or "").strip()
+        embedded_bytes = _decode_embedded_resource(parameters, chain=node_chain, label=label)
+        source_bytes: bytes | None = None
+        source_name = str(parameters.get("_embedded_name", "") or "").strip()
         recovered = False
 
         if bool(parameters.get("embedded")) and embedded_bytes is not None:
-            image_bytes = embedded_bytes
-            report.already_embedded_images += 1
+            source_bytes = embedded_bytes
+            if is_mesh:
+                report.already_embedded_meshes += 1
+            else:
+                report.already_embedded_images += 1
         elif path_text:
             try:
-                image_path = resolve_authored_path(path_text, owner_path)
+                source_path = resolve_authored_path(path_text, owner_path)
             except ValueError as exc:
                 if embedded_bytes is None:
                     raise SelfContainedGraphError(str(exc), chain=node_chain) from exc
-                image_path = None
-            if image_path is not None and image_path.is_file():
+                source_path = None
+            if source_path is not None and source_path.is_file():
                 try:
-                    image_bytes = image_path.read_bytes()
-                    image_name = image_path.name
+                    source_bytes = source_path.read_bytes()
+                    source_name = source_path.name
                 except OSError as exc:
                     if embedded_bytes is None:
                         raise SelfContainedGraphError(
-                            f"Could not read image source:\n{image_path}\n{exc}", chain=node_chain
+                            f"Could not read {label} source:\n{source_path}\n{exc}", chain=node_chain
                         ) from exc
-            if image_bytes is None and embedded_bytes is not None:
-                image_bytes = embedded_bytes
+            if source_bytes is None and embedded_bytes is not None:
+                source_bytes = embedded_bytes
                 recovered = True
         elif embedded_bytes is not None:
-            image_bytes = embedded_bytes
-            report.already_embedded_images += 1
+            source_bytes = embedded_bytes
+            if is_mesh:
+                report.already_embedded_meshes += 1
+            else:
+                report.already_embedded_images += 1
 
-        if image_bytes is None:
+        if source_bytes is None:
             raise SelfContainedGraphError(
-                f"Image source is missing and no embedded copy is available:\n{path_text or 'No path'}",
+                f"{label.title()} source is missing and no embedded copy is available:\n{path_text or 'No path'}",
                 chain=node_chain,
             )
         if recovered:
-            report.recovered_images += 1
+            if is_mesh:
+                report.recovered_meshes += 1
+            else:
+                report.recovered_images += 1
             report.warnings.append(
-                f"{' → '.join(node_chain)} recovered its image from stored embedded bytes."
+                f"{' → '.join(node_chain)} recovered its {label} from stored embedded bytes."
             )
         parameters["embedded"] = True
         parameters["path"] = ""
-        parameters["_embedded_data"] = base64.b64encode(image_bytes).decode("ascii")
-        parameters["_embedded_name"] = image_name or "embedded-image"
+        parameters["_embedded_data"] = base64.b64encode(source_bytes).decode("ascii")
+        parameters["_embedded_name"] = source_name or ("embedded-mesh.obj" if is_mesh else "embedded-image")
         if path_text:
             parameters["_embedded_original_name"] = Path(path_text).name
 
+    # The node parameters above are authoritative here: linked sources have just
+    # been converted to embedded payloads.  Re-loading the project resource
+    # library via migrate_project_resources() would first hydrate those nodes
+    # from the stale, still-linked records and undo the embedding work.
+    resources_data = result.get("resources")
+    library = GraphResourceLibrary.from_dict(
+        resources_data if isinstance(resources_data, Mapping) else None
+    )
+    library.capture_serialized_nodes(result.get("nodes", ()))
+    library.prune_unreferenced_serialized(result.get("nodes", ()))
+    result["resources"] = library.to_dict()
+    library.compact_serialized_nodes(result.get("nodes", ()))
+    result["version"] = 20
     return result
 
 
@@ -315,7 +355,7 @@ def build_self_contained_graph(
     owner_path: str | Path | None = None,
     app_version: str = "",
 ) -> tuple[dict[str, Any], SelfContainedExportReport]:
-    """Return a deep-copied graph whose nested graphs and images are embedded."""
+    """Return a deep-copied graph whose nested graphs, images and meshes are embedded."""
 
     if not isinstance(data, Mapping):
         raise SelfContainedGraphError("The graph data is invalid.")
@@ -340,8 +380,24 @@ def build_self_contained_graph(
     return result, report
 
 
+def _resource_record_for_node(
+    graph: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    uid = str(parameters.get("_resource_id", "") or "").strip()
+    resources = graph.get("resources")
+    if not uid or not isinstance(resources, Mapping):
+        return None
+    items = resources.get("items", resources.get("resources", ()))
+    if not isinstance(items, (list, tuple)):
+        return None
+    return next(
+        (item for item in items if isinstance(item, Mapping) and str(item.get("uid", "")) == uid),
+        None,
+    )
+
+
 def validate_self_contained_graph(data: Mapping[str, Any]) -> None:
-    """Verify that a graph requires no external graph or image resources."""
+    """Verify that a graph requires no external graph, image or mesh resources."""
 
     def walk(graph: Mapping[str, Any], chain: list[str], ancestry: set[str], depth: int) -> None:
         if depth > 64:
@@ -377,17 +433,36 @@ def validate_self_contained_graph(data: Mapping[str, Any]) -> None:
                         "An embedded Graph Instance has no graph data.", chain=node_chain
                     )
                 walk(child, [*chain, _graph_label(child, node_name)], ancestry, depth + 1)
-            elif type_id == "input.image":
-                if not bool(parameters.get("embedded")):
-                    raise SelfContainedGraphError("An Image Input is not embedded.", chain=node_chain)
-                if str(parameters.get("path", "") or "").strip():
+            elif type_id in {"input.image", "input.mesh"}:
+                label = "Mesh Input" if type_id == "input.mesh" else "Image Input"
+                resource = _resource_record_for_node(graph, parameters)
+                embedded = bool(
+                    parameters.get("embedded")
+                    or parameters.get("_embedded_data")
+                    or (resource and (resource.get("embedded") or resource.get("embedded_data")))
+                )
+                source_path = str(
+                    parameters.get("path", "")
+                    or (resource.get("source_path", "") if resource else "")
+                    or ""
+                ).strip()
+                encoded = str(
+                    parameters.get("_embedded_data", "")
+                    or (resource.get("embedded_data", "") if resource else "")
+                    or ""
+                ).strip()
+                if not embedded:
+                    raise SelfContainedGraphError(f"A {label} is not embedded.", chain=node_chain)
+                if source_path:
                     raise SelfContainedGraphError(
-                        "An embedded Image Input still contains an external path.", chain=node_chain
+                        f"An embedded {label} still contains an external path.", chain=node_chain
                     )
-                _decode_embedded_image(parameters, chain=node_chain)
-                if not str(parameters.get("_embedded_data", "") or "").strip():
+                _decode_embedded_resource(
+                    {"_embedded_data": encoded}, chain=node_chain, label=label.casefold()
+                )
+                if not encoded:
                     raise SelfContainedGraphError(
-                        "An Image Input contains no embedded bytes.", chain=node_chain
+                        f"A {label} contains no embedded bytes.", chain=node_chain
                     )
 
     label = _graph_label(data, "Graph")
@@ -403,6 +478,8 @@ def recovery_summary(data: Mapping[str, Any]) -> dict[str, int]:
         "cached_graphs": 0,
         "external_images": 0,
         "embedded_images": 0,
+        "external_meshes": 0,
+        "embedded_meshes": 0,
     }
     def walk(graph: Mapping[str, Any], depth: int) -> None:
         # Serialized graph dictionaries cannot contain Python reference cycles.
@@ -430,11 +507,18 @@ def recovery_summary(data: Mapping[str, Any]) -> dict[str, int]:
                 child = embedded if isinstance(embedded, Mapping) else cached
                 if isinstance(child, Mapping):
                     walk(child, depth + 1)
-            elif type_id == "input.image":
-                if bool(params.get("embedded")) or str(params.get("_embedded_data", "") or ""):
-                    counts["embedded_images"] += 1
+            elif type_id in {"input.image", "input.mesh"}:
+                plural = "meshes" if type_id == "input.mesh" else "images"
+                resource = _resource_record_for_node(graph, params)
+                embedded = bool(
+                    params.get("embedded")
+                    or params.get("_embedded_data")
+                    or (resource and (resource.get("embedded") or resource.get("embedded_data")))
+                )
+                if embedded:
+                    counts[f"embedded_{plural}"] += 1
                 else:
-                    counts["external_images"] += 1
+                    counts[f"external_{plural}"] += 1
 
     walk(data, 0)
     return counts

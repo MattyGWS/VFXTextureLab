@@ -19,10 +19,13 @@ class MeshData:
     indices: np.ndarray  # uint32 triangles
     name: str = "Mesh"
     cache_key: str = ""
+    uv_origin: str = "top-left"
 
     def __post_init__(self) -> None:
         self.vertices = np.ascontiguousarray(self.vertices, dtype=np.float32).reshape(-1, 8)
         self.indices = np.ascontiguousarray(self.indices, dtype=np.uint32).reshape(-1)
+        value = str(self.uv_origin or "top-left").strip().casefold().replace("_", "-")
+        self.uv_origin = "bottom-left" if value in {"bottom-left", "bottomleft", "v-up", "standard", "obj"} else "top-left"
         if self.indices.size % 3:
             raise ValueError("Mesh indices must describe triangles")
 

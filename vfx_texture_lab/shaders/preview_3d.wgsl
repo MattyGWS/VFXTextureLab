@@ -44,6 +44,7 @@ struct VertexOutput {
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) shadow_position: vec4<f32>,
+    @location(4) tangent_uv: vec2<f32>,
 };
 
 struct ShadowOutput {
@@ -66,6 +67,14 @@ struct PivotOutput {
 };
 
 fn material_uv(uv: vec2<f32>) -> vec2<f32> {
+    var sampled = uv;
+    if (uniforms.uv_settings.y > 0.5) {
+        sampled.y = 1.0 - sampled.y;
+    }
+    return sampled * max(uniforms.uv_settings.x, 0.001);
+}
+
+fn tangent_uv(uv: vec2<f32>) -> vec2<f32> {
     return uv * max(uniforms.uv_settings.x, 0.001);
 }
 
@@ -104,6 +113,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.world_normal = normalize((uniforms.model * vec4<f32>(normalize(input.normal), 0.0)).xyz);
     output.uv = material_uv(input.uv);
     output.shadow_position = uniforms.light_view_proj * world;
+    output.tangent_uv = tangent_uv(input.uv);
     return output;
 }
 
@@ -170,8 +180,13 @@ fn derivative_tangent_basis(position: vec3<f32>, uv: vec2<f32>, normal: vec3<f32
         let tangent = normalize(cross(helper, normal));
         return mat3x3<f32>(tangent, normalize(cross(normal, tangent)), normal);
     }
-    var tangent = normalize(dp1 * duv2.y - dp2 * duv1.y);
-    let raw_bitangent = normalize(-dp1 * duv2.x + dp2 * duv1.x);
+    // Dividing by the UV determinant is unnecessary after normalisation, but
+    // retaining its sign is mandatory for mirrored UV charts. Without it the
+    // tangent axes reverse on those islands and standards-compliant baked
+    // normal maps appear to need an arbitrary red/green channel inversion.
+    let uv_orientation = select(-1.0, 1.0, determinant >= 0.0);
+    var tangent = normalize((dp1 * duv2.y - dp2 * duv1.y) * uv_orientation);
+    let raw_bitangent = normalize((-dp1 * duv2.x + dp2 * duv1.x) * uv_orientation);
     tangent = normalize(tangent - normal * dot(normal, tangent));
     let handedness = select(-1.0, 1.0, dot(cross(normal, tangent), raw_bitangent) >= 0.0);
     let bitangent = normalize(cross(normal, tangent)) * handedness;
@@ -204,7 +219,7 @@ fn tangent_map_sample(uv: vec2<f32>) -> vec3<f32> {
 
 fn surface_normal(input: VertexOutput, front_facing: bool) -> vec3<f32> {
     let base_normal = mesh_normal(input, front_facing);
-    let tbn = derivative_tangent_basis(input.world_position, input.uv, base_normal);
+    let tbn = derivative_tangent_basis(input.world_position, input.tangent_uv, base_normal);
     var tangent_normal = vec3<f32>(0.0, 0.0, 1.0);
 
     if (uniforms.texture_info.z > 0.5 && uniforms.flags2.x > 0.5) {
@@ -213,9 +228,10 @@ fn surface_normal(input: VertexOutput, front_facing: bool) -> vec3<f32> {
         let right = sampled_height(input.uv + vec2<f32>(texel.x, 0.0));
         let down = sampled_height(input.uv - vec2<f32>(0.0, texel.y));
         let up = sampled_height(input.uv + vec2<f32>(0.0, texel.y));
+        let uv_y_sign = select(1.0, -1.0, uniforms.uv_settings.y > 0.5);
         tangent_normal = normalize(vec3<f32>(
             (left - right) * uniforms.material0.z,
-            (down - up) * uniforms.material0.z,
+            (down - up) * uniforms.material0.z * uv_y_sign,
             1.0
         ));
     }

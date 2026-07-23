@@ -1,5 +1,12 @@
+# Python 3.11-3.13: setup keeps xatlas on a wheel-compatible runtime; Embree baking is supplied by embreex wheels.
 PySide6>=6.8,<7
 numpy>=2.0,<3
 Pillow>=10,<13
 wgpu>=0.31,<0.32
 rendercanvas>=2.4,<3
+fast-simplification>=0.1.13,<0.2
+xatlas>=0.0.11,<0.1
+trimesh>=4.8,<5
+embreex>=4.4,<5
+scipy>=1.14,<2
+scikit-image>=0.25,<0.27

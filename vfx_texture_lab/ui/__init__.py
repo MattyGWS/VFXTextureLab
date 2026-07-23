@@ -6,7 +6,7 @@ from .parameters import ParametersPanel
 from .preview import PreviewPanel
 from .timeline import TimelinePanel
 from .canvas_editor import CanvasPanel
-from .graph_explorer import GraphExplorer, ExplorerGraphInfo
+from .graph_explorer import GraphExplorer, ExplorerFolderInfo, ExplorerGraphInfo, ExplorerResourceInfo
 from .visual_editor_foundation import VisualEditorCanvas
 from .vfx_package import VFXPackageDialog, VFXPackageExportOptionsDialog
 from .export_template_library import ExportTemplateLibraryDialog
@@ -21,6 +21,8 @@ __all__ = [
     "CanvasPanel",
     "GraphExplorer",
     "ExplorerGraphInfo",
+    "ExplorerFolderInfo",
+    "ExplorerResourceInfo",
     "CustomNodeDiagnosticsDialog",
     "CustomNodeLibrariesDialog",
     "VisualEditorCanvas",

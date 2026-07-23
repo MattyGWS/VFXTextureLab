@@ -4,6 +4,8 @@ from pathlib import Path
 import time
 from typing import Any, Mapping
 
+import numpy as np
+
 from PySide6.QtCore import QPoint, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import (
@@ -1185,32 +1187,50 @@ class ThreeDPreviewPanel(QWidget):
             self._last_summary = "Double-click a Material node to evaluate it in 3D."
             self._set_status_text(self._last_summary)
 
-    def show_geometry(self, mesh, *, name: str | None = None) -> None:
-        """Display procedural geometry with neutral shaded inspection material."""
+    def show_geometry(
+        self, mesh, *, name: str | None = None, preview_texture=None,
+        preview_textures: dict[str, np.ndarray] | None = None,
+        preview_settings: dict[str, object] | None = None,
+    ) -> None:
+        """Display procedural geometry with neutral shading or authored preview maps."""
         if not self._geometry_inspection:
             self._geometry_previous_result = self._last_result
             self._geometry_previous_cache_key = self._last_cache_key
         self._geometry_inspection = True
         self._active_output = True
         self.canvas.renderer.set_geometry_override(mesh, inspection=True)
-        # Empty texture input asks the renderer for its established neutral PBR
-        # defaults.  This gives useful shaded faces and studio lighting without
-        # pretending the geometry owns a material.
-        self.canvas.renderer.update_material(
-            {}, frozenset(),
-            {
-                "name": str(name or getattr(mesh, "name", "Geometry")),
-                "surface_mode": "Opaque",
-                "two_sided": True,
-                "emissive_intensity": 1.0,
-                "normal_strength": 1.0,
-                "normal_y": "OpenGL (+Y)",
-                "derive_normals": False,
-            },
-        )
+        # UV Unwrap may provide a presentation-only image. Apply it as Base
+        # Colour so the artist can inspect stretching and island orientation on
+        # the actual mesh without creating a Material node or invalidating the
+        # unwrap. Other geometry nodes retain the established neutral PBR look.
+        textures = {
+            str(channel): array
+            for channel, array in (preview_textures or {}).items()
+            if isinstance(array, np.ndarray)
+        }
+        if "Base Colour" not in textures and isinstance(preview_texture, np.ndarray):
+            textures["Base Colour"] = preview_texture
+        connected = frozenset(textures)
+        settings = {
+            "name": str(name or getattr(mesh, "name", "Geometry")),
+            "surface_mode": "Opaque",
+            "two_sided": True,
+            "emissive_intensity": 1.0,
+            "normal_strength": 1.0,
+            "normal_y": "OpenGL (+Y)",
+            "derive_normals": False,
+        }
+        settings.update(dict(preview_settings or {}))
+        self.canvas.renderer.update_material(textures, connected, settings)
         self.title.setText(str(name or getattr(mesh, "name", "Geometry")))
+        if any(channel != "Base Colour" for channel in textures):
+            preview_detail = "baked material preview on mesh · "
+        elif textures:
+            preview_detail = "UV surface preview on mesh · "
+        else:
+            preview_detail = ""
         self._last_summary = (
-            f"{self.canvas.renderer.mesh_summary} · shaded + wireframe geometry inspection · "
+            f"{self.canvas.renderer.mesh_summary} · {preview_detail}shaded + wireframe geometry inspection · "
             "UVs and vertex normals present"
         )
         self._set_status_text(self._last_summary)

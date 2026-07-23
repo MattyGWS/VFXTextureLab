@@ -268,6 +268,15 @@ class NodeDefinition:
     # They remain ordinary snapshot nodes so branch revision and dependency
     # traversal continue to work, but cannot be connected downstream.
     terminal: bool = False
+    # Expensive nodes may expose a reusable manual action in the Inspector.
+    # Parameter changes mark the last successful result stale but do not
+    # automatically perform the expensive operation again.
+    manual_action_label: str = ""
+    manual_action_relevant_parameters: tuple[str, ...] = ()
+    # Inputs used only to present or inspect a result. They may refresh an
+    # interactive preview, but must not alter the authored output revision or
+    # be evaluated during final/export geometry requests.
+    presentation_only_inputs: tuple[str, ...] = ()
 
     @property
     def output_names(self) -> tuple[str, ...]:
@@ -358,3 +367,35 @@ class NodeDefinition:
             "package_version": package.version if package else None,
             "api_version": package.api_version if package else None,
         }
+
+
+def normalise_interrupted_manual_action(
+    definition: NodeDefinition,
+    parameters: dict[str, Any],
+) -> bool:
+    """Seal an interrupted manual request when reconstructing a graph.
+
+    A saved result is durable, but a worker request is process-local.  Graphs
+    can be autosaved while a manual operation is running, so reopening must not
+    interpret ``requested > completed`` as permission to execute again.  This
+    helper deliberately mutates the supplied parameter dictionary and returns
+    whether any transient state was repaired.
+    """
+
+    if not definition.manual_action_label:
+        return False
+    requested = int(parameters.get("_manual_run_serial", 0) or 0)
+    completed = int(parameters.get("_manual_completed_serial", 0) or 0)
+    status = str(parameters.get("_manual_status", "") or "")
+    interrupted = status in {"Running", "Cancelling"} or requested > completed
+    if not interrupted:
+        return False
+    parameters["_manual_completed_serial"] = max(requested, completed)
+    parameters["_manual_status"] = (
+        "Cancelled"
+        if str(parameters.get("_manual_result_data", "") or "")
+        else "Not Run"
+    )
+    parameters["_manual_changed_during_run"] = False
+    parameters["_manual_last_error"] = ""
+    return True

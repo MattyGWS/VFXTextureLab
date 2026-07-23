@@ -201,6 +201,13 @@ class VFXPackageDialog(QDialog):
                     details_frame,
                 )
             )
+        if info.mesh_sources:
+            details_layout.addWidget(
+                QLabel(
+                    f"Included mesh source files: {len(info.mesh_sources)}",
+                    details_frame,
+                )
+            )
         if info.export_templates:
             details_layout.addWidget(
                 QLabel(

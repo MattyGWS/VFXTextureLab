@@ -16,14 +16,19 @@ except ImportError:  # pragma: no cover - CPU-only installations show a friendly
 from ..engine.cache import CacheStats, MemoryLRU
 from .environment import load_environment, mip_chain
 from .meshes import MeshData, mesh_for_settings
-from .settings import MATERIAL_DEFAULT_VALUES, MATERIAL_INPUTS, normalise_surface_mode, viewport_settings
+from .settings import (
+    AUTO_WIREFRAME_TRIANGLE_LIMIT,
+    MATERIAL_DEFAULT_VALUES,
+    MATERIAL_INPUTS,
+    normalise_surface_mode,
+    viewport_settings,
+)
 
 
 MATERIAL_BINDINGS = MATERIAL_INPUTS
 SCENE_FORMAT = "rgba16float"
 SHADOW_FORMAT = "depth32float"
 SHADOW_SIZE = 1536
-AUTO_WIREFRAME_TRIANGLE_LIMIT = 250_000
 
 
 @dataclass(slots=True)
@@ -1356,7 +1361,15 @@ class ThreeDRenderer:
                 dtype=np.float32,
             ),
             np.array(
-                (float(settings.get("material_tiling", 1.0)), 0.0, 0.0, 0.0),
+                (
+                    float(settings.get("material_tiling", 1.0)),
+                    1.0 if (
+                        self._mesh is not None
+                        and str(getattr(self._mesh, "uv_origin", "top-left")) == "bottom-left"
+                    ) else 0.0,
+                    0.0,
+                    0.0,
+                ),
                 dtype=np.float32,
             ),
         ]
@@ -1780,7 +1793,10 @@ class ThreeDRenderer:
             and str(self.settings.get("wireframe", "Auto")) == "Auto"
             and self._mesh.triangle_count > AUTO_WIREFRAME_TRIANGLE_LIMIT
         ):
-            summary += " · Auto wireframe hidden for dense preview"
+            summary += (
+                f" · Auto wireframe hidden above {AUTO_WIREFRAME_TRIANGLE_LIMIT:,} triangles"
+                " (choose Always to force)"
+            )
         return summary
 
     def release(self) -> None:

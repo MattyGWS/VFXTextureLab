@@ -12,7 +12,13 @@ from PySide6.QtCore import QPointF, QRectF, Signal, QTimer, Qt
 from PySide6.QtGui import QColor, QPainterPath, QPainterPathStroker, QPen, QUndoStack
 from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsScene
 
-from ..nodes.base import NodeDefinition, is_image_kind, normalise_port_kind, port_kinds_compatible
+from ..nodes.base import (
+    NodeDefinition,
+    is_image_kind,
+    normalise_interrupted_manual_action,
+    normalise_port_kind,
+    port_kinds_compatible,
+)
 from ..canvas_node import ensure_canvas_parameters
 from ..graph_assets import (
     GRAPH_INPUT_TYPE, GRAPH_OUTPUT_TYPE, GRAPH_INSTANCE_TYPE,
@@ -21,7 +27,7 @@ from ..graph_assets import (
 )
 from ..nodes.registry import NodeRegistry
 from .items import ConnectionItem, GroupFrameItem, GroupPortItem, NodeItem, PortalNodeItem, PortItem, RerouteItem
-from .undo import GraphSnapshotCommand
+from .undo import GraphSnapshotCommand, NodeParameterCommand
 
 
 class GraphScene(QGraphicsScene):
@@ -61,6 +67,10 @@ class GraphScene(QGraphicsScene):
         self._action_text = "Edit Graph"
         self._action_changed = False
         self._action_merge_key: str | None = None
+        # One-shot context for listeners that can avoid rebuilding an unchanged
+        # published result. Manual-action settings are authored graph edits, but
+        # they do not alter the current mesh until the artist presses the action.
+        self._graph_change_hint: tuple[str, str] | None = None
 
         self.setSceneRect(-1800, -1800, 3600, 3600)
         self.selectionChanged.connect(self._selection_changed)
@@ -666,6 +676,11 @@ class GraphScene(QGraphicsScene):
             # action. It still refreshes correctly, but won't be undoable.
             self.graphChanged.emit()
 
+    def consume_graph_change_hint(self) -> tuple[str, str] | None:
+        hint = self._graph_change_hint
+        self._graph_change_hint = None
+        return hint
+
     def perform_action(
         self,
         text: str,
@@ -884,6 +899,12 @@ class GraphScene(QGraphicsScene):
             try:
                 from ..nodes.input_nodes import refresh_image_metadata
                 refresh_image_metadata(effective_parameters)
+            except Exception:
+                pass
+        elif type_id == "input.mesh":
+            try:
+                from ..geometry import refresh_mesh_metadata
+                refresh_mesh_metadata(effective_parameters)
             except Exception:
                 pass
         if type_id == "graph.send":
@@ -1185,48 +1206,71 @@ class GraphScene(QGraphicsScene):
             self.reload_graph_instance(node, path=destination, record_undo=True)
         return True
 
-    def matching_image_inputs(self, reference: NodeItem) -> list[NodeItem]:
-        if reference.definition.type_id != "input.image":
+    @staticmethod
+    def _file_resource_kind(node: NodeItem) -> str | None:
+        if node.definition.type_id == "input.image":
+            return "image"
+        if node.definition.type_id == "input.mesh":
+            return "mesh"
+        return None
+
+    def matching_file_inputs(self, reference: NodeItem) -> list[NodeItem]:
+        kind = self._file_resource_kind(reference)
+        if kind is None:
             return []
         path_text = str(reference.parameters.get("path", "") or "").strip()
         return [
             candidate for candidate in self.nodes.values()
-            if candidate.definition.type_id == "input.image"
-            and (candidate is reference or (path_text and str(candidate.parameters.get("path", "") or "").strip() == path_text))
+            if self._file_resource_kind(candidate) == kind
+            and (
+                candidate is reference
+                or (
+                    path_text
+                    and str(candidate.parameters.get("path", "") or "").strip() == path_text
+                )
+            )
         ]
 
-    def relink_image_inputs(
+    def relink_file_inputs(
         self, reference: NodeItem, path: str | Path, *, matching: bool = False
     ) -> int:
-        if reference.definition.type_id != "input.image":
+        kind = self._file_resource_kind(reference)
+        if kind is None:
             return 0
-        targets = self.matching_image_inputs(reference) if matching else [reference]
+        targets = self.matching_file_inputs(reference) if matching else [reference]
         source = str(Path(path).expanduser().resolve())
+        noun = "Mesh" if kind == "mesh" else "Image"
 
         def apply() -> None:
-            from ..nodes.input_nodes import refresh_image_metadata
+            if kind == "mesh":
+                from ..geometry import refresh_mesh_metadata as refresh_metadata
+            else:
+                from ..nodes.input_nodes import refresh_image_metadata as refresh_metadata
             for target in targets:
                 target.parameters["path"] = source
                 target.parameters["embedded"] = False
                 target.parameters.pop("_embedded_data", None)
                 target.parameters.pop("_embedded_name", None)
                 target.parameters.pop("_embedded_original_name", None)
+                target.parameters.pop("_resource_sha256", None)
                 target.parameters.pop("_packaged_source_path", None)
                 target.parameters.pop("_packaged_source_sha256", None)
-                refresh_image_metadata(target.parameters)
-            self._resolve_dynamic_types()
-            self._remove_incompatible_connections()
+                refresh_metadata(target.parameters)
+            if kind == "image":
+                self._resolve_dynamic_types()
+                self._remove_incompatible_connections()
             self._refresh_all_groups()
             self._touch()
 
         self.perform_action(
-            "Relink Matching Images" if matching and len(targets) > 1 else "Relink Image",
+            f"Relink Matching {noun}s" if matching and len(targets) > 1 else f"Relink {noun}",
             apply,
         )
         return len(targets)
 
-    def embed_image_input(self, node: NodeItem, *, source_path: str | Path | None = None) -> bool:
-        if node.definition.type_id != "input.image":
+    def embed_file_input(self, node: NodeItem, *, source_path: str | Path | None = None) -> bool:
+        kind = self._file_resource_kind(node)
+        if kind is None:
             return False
         encoded = str(node.parameters.get("_embedded_data", "") or "").strip()
         data: bytes | None = None
@@ -1241,26 +1285,41 @@ class GraphScene(QGraphicsScene):
         if data is None:
             return False
         original_text = str(node.parameters.get("path", "") or "").strip()
-        embedded_name = (source.name if source is not None else str(node.parameters.get("_embedded_name", "") or ""))
+        embedded_name = source.name if source is not None else str(
+            node.parameters.get("_embedded_name", "") or ""
+        )
         if not embedded_name and original_text:
             embedded_name = Path(original_text).name
+        fallback_name = "embedded-mesh.obj" if kind == "mesh" else "embedded-image"
+        noun = "Mesh" if kind == "mesh" else "Image"
 
         def apply() -> None:
             node.parameters["embedded"] = True
             node.parameters["path"] = ""
             node.parameters["_embedded_data"] = base64.b64encode(data).decode("ascii")
-            node.parameters["_embedded_name"] = embedded_name or "embedded-image"
+            node.parameters.pop("_resource_sha256", None)
+            node.parameters["_embedded_name"] = embedded_name or fallback_name
             if original_text:
                 node.parameters["_embedded_original_name"] = Path(original_text).name
+            if kind == "mesh":
+                from ..geometry import refresh_mesh_metadata
+                refresh_mesh_metadata(node.parameters)
+            else:
+                from ..nodes.input_nodes import refresh_image_metadata
+                refresh_image_metadata(node.parameters)
+                self._resolve_dynamic_types()
+                self._remove_incompatible_connections()
+            self._refresh_all_groups()
             self._touch()
 
-        self.perform_action("Make Image Local", apply)
+        self.perform_action(f"Make {noun} Local", apply)
         return True
 
-    def restore_embedded_image(
+    def restore_embedded_file(
         self, node: NodeItem, path: str | Path, *, relink: bool = True
     ) -> bool:
-        if node.definition.type_id != "input.image":
+        kind = self._file_resource_kind(node)
+        if kind is None:
             return False
         encoded = str(node.parameters.get("_embedded_data", "") or "").strip()
         if not encoded:
@@ -1268,15 +1327,48 @@ class GraphScene(QGraphicsScene):
         try:
             data = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as exc:
-            raise ValueError("The embedded image data is damaged.") from exc
+            raise ValueError(f"The embedded {kind} data is damaged.") from exc
         destination = Path(path).expanduser()
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_bytes(data)
         temporary.replace(destination)
         if relink:
-            self.relink_image_inputs(node, destination, matching=False)
+            self.relink_file_inputs(node, destination, matching=False)
         return True
+
+    # Backwards-compatible Image Input helpers used by existing UI/tests.
+    def matching_image_inputs(self, reference: NodeItem) -> list[NodeItem]:
+        return self.matching_file_inputs(reference) if reference.definition.type_id == "input.image" else []
+
+    def relink_image_inputs(
+        self, reference: NodeItem, path: str | Path, *, matching: bool = False
+    ) -> int:
+        return self.relink_file_inputs(reference, path, matching=matching) if reference.definition.type_id == "input.image" else 0
+
+    def embed_image_input(self, node: NodeItem, *, source_path: str | Path | None = None) -> bool:
+        return self.embed_file_input(node, source_path=source_path) if node.definition.type_id == "input.image" else False
+
+    def restore_embedded_image(
+        self, node: NodeItem, path: str | Path, *, relink: bool = True
+    ) -> bool:
+        return self.restore_embedded_file(node, path, relink=relink) if node.definition.type_id == "input.image" else False
+
+    def matching_mesh_inputs(self, reference: NodeItem) -> list[NodeItem]:
+        return self.matching_file_inputs(reference) if reference.definition.type_id == "input.mesh" else []
+
+    def relink_mesh_inputs(
+        self, reference: NodeItem, path: str | Path, *, matching: bool = False
+    ) -> int:
+        return self.relink_file_inputs(reference, path, matching=matching) if reference.definition.type_id == "input.mesh" else 0
+
+    def embed_mesh_input(self, node: NodeItem, *, source_path: str | Path | None = None) -> bool:
+        return self.embed_file_input(node, source_path=source_path) if node.definition.type_id == "input.mesh" else False
+
+    def restore_embedded_mesh(
+        self, node: NodeItem, path: str | Path, *, relink: bool = True
+    ) -> bool:
+        return self.restore_embedded_file(node, path, relink=relink) if node.definition.type_id == "input.mesh" else False
 
     def refresh_linked_graph_assets(self) -> list[tuple[str, str]]:
         """Poll linked files and reload changed assets without interrupting editing."""
@@ -2460,10 +2552,69 @@ class GraphScene(QGraphicsScene):
 
         self.perform_action("Edit Graph Asset Parameter", change)
 
+    def _refresh_manual_parameter_status(self, node: NodeItem) -> None:
+        if not node.definition.manual_action_label or not node.parameters.get("_manual_result_data"):
+            return
+        status = str(node.parameters.get("_manual_status", "") or "")
+        if status in {"Running", "Cancelling"}:
+            node.parameters["_manual_changed_during_run"] = True
+            return
+        applied = node.parameters.get("_manual_applied_parameters", {})
+        relevant = tuple(node.definition.manual_action_relevant_parameters)
+        is_current = isinstance(applied, dict) and all(
+            node.parameters.get(parameter_name) == applied.get(parameter_name)
+            for parameter_name in relevant
+        )
+        node.parameters["_manual_status"] = "Up to Date" if is_current else "Out of Date"
+        node.parameters["_manual_last_error"] = ""
+
+    def apply_lightweight_node_parameter(
+        self, node_uid: str, name: str, value: Any
+    ) -> None:
+        """Apply one manual-node setting without snapshotting persistent mesh data."""
+
+        node = self.nodes.get(str(node_uid))
+        if node is None:
+            return
+        node.parameters[str(name)] = value
+        self._refresh_manual_parameter_status(node)
+        self._graph_change_hint = ("manual-settings-only", str(node.uid))
+        self.graphChanged.emit()
+
     def change_node_parameter(self, node: NodeItem, name: str, value: Any, *, label: str | None = None) -> None:
         if node.definition.type_id == "graph.send" and name == "channel_name":
             value = self._unique_portal_name(str(value), excluding_uid=node.uid)
         if node.parameters.get(name) == value:
+            return
+        manual_relevant = (
+            bool(node.definition.manual_action_label)
+            and name in set(node.definition.manual_action_relevant_parameters)
+            and bool(node.parameters.get("_manual_result_data"))
+        )
+        if manual_relevant:
+            # Persistent manual results may be many megabytes. A complete graph
+            # snapshot for every slider tick copied that payload twice and was
+            # the remaining Best Packing/UI pause. Store only this parameter
+            # delta while retaining ordinary undo merging. Apply first, then push
+            # an already-applied command so graphChanged observes the updated
+            # QUndoStack dirty state.
+            before = node.parameters.get(name)
+            node.parameters[name] = value
+            self._refresh_manual_parameter_status(node)
+            self.undo_stack.push(
+                NodeParameterCommand(
+                    self,
+                    node.uid,
+                    name,
+                    before,
+                    value,
+                    label or f"Change {name.replace('_', ' ').title()}",
+                    merge_key=f"node:{node.uid}:parameter:{name}",
+                    already_applied=True,
+                )
+            )
+            self._graph_change_hint = ("manual-settings-only", str(node.uid))
+            self.graphChanged.emit()
             return
 
         def change() -> None:
@@ -3136,7 +3287,7 @@ class GraphScene(QGraphicsScene):
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": "vfx-texture-lab-graph",
-            "version": 18,
+            "version": 20,
             "active_node": self.active_node.uid if self.active_node else None,
             "active_output": self.active_output_name,
             "nodes": [
@@ -3231,6 +3382,14 @@ class GraphScene(QGraphicsScene):
                     parameters=dict(node_data.get("parameters", {})),
                     group_uid=str(node_data.get("group")) if node_data.get("group") else None,
                 )
+                # Manual actions are persisted with their last successful
+                # result, but an in-flight request itself is deliberately not
+                # resumed after a crash, autosave recovery or ordinary reopen.
+                # Sealing the serial here is essential: otherwise focusing a
+                # graph saved while an unwrap was running would silently launch
+                # the expensive operation again without the user pressing its
+                # Inspector action button.
+                normalise_interrupted_manual_action(node.definition, node.parameters)
                 thumbnail_output = str(node_data.get("thumbnail_output", "") or "") or None
                 if thumbnail_output in node.thumbnail_output_names():
                     node.thumbnail_output_name = thumbnail_output

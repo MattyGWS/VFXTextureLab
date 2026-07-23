@@ -38,7 +38,9 @@ def eval_color(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], con
     return np.broadcast_to(color, (context.height, context.width, 4)).copy()
 
 
-def eval_linear_gradient(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], context: EvalContext) -> ImageArray:
+def _linear_gradient_coordinate(
+    params: Mapping[str, Any], context: EvalContext
+) -> np.ndarray:
     u, v = _uv(context)
     angle = math.radians(float(params["angle"]))
     direction_x = math.cos(angle)
@@ -48,6 +50,24 @@ def eval_linear_gradient(_inputs: Mapping[str, ImageArray], params: Mapping[str,
     value = centered_u * direction_x + centered_v * direction_y + 0.5 + float(params["offset"])
     if bool(params["repeat"]):
         value = np.mod(value, 1.0)
+    return np.clip(value, 0.0, 1.0).astype(np.float32)
+
+
+def eval_linear_gradient(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], context: EvalContext) -> ImageArray:
+    return grayscale_rgba(_linear_gradient_coordinate(params, context))
+
+
+def eval_linear_gradient_2(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], context: EvalContext) -> ImageArray:
+    """Smooth periodic black-white-black dome profile."""
+    coordinate = _linear_gradient_coordinate(params, context)
+    value = np.float32(0.5) - np.float32(0.5) * np.cos(coordinate * np.float32(math.tau))
+    return grayscale_rgba(np.clip(value, 0.0, 1.0))
+
+
+def eval_linear_gradient_3(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], context: EvalContext) -> ImageArray:
+    """Linear black-white-black profile with a deliberately sharp centre ridge."""
+    coordinate = _linear_gradient_coordinate(params, context)
+    value = np.float32(1.0) - np.abs(coordinate * np.float32(2.0) - np.float32(1.0))
     return grayscale_rgba(np.clip(value, 0.0, 1.0))
 
 
@@ -1239,6 +1259,36 @@ def register_generator_nodes(registry: NodeRegistry) -> None:
             gpu_kernel="linear_gradient.wgsl",
         ),
         NodeDefinition(
+            "generator.linear_gradient_2",
+            "Linear Gradient 2",
+            "Gradients",
+            eval_linear_gradient_2,
+            parameters=(
+                f("angle", "Angle", "float", 90.0, -180.0, 180.0, 1.0, animatable=True, editor="angle", unit="degrees", fine_step=1.0, coarse_step=5.0),
+                f("offset", "Offset", "float", 0.0, -1.0, 1.0, 0.01, animatable=True),
+                f("repeat", "Repeat", "bool", True),
+            ),
+            description="A smooth black-to-white-to-black directional dome gradient.",
+            tags=("ramp", "directional", "smooth", "dome", "tile"), accent="#6876df",
+            output_format="r16f",
+            gpu_kernel="linear_gradient.wgsl",
+        ),
+        NodeDefinition(
+            "generator.linear_gradient_3",
+            "Linear Gradient 3",
+            "Gradients",
+            eval_linear_gradient_3,
+            parameters=(
+                f("angle", "Angle", "float", 90.0, -180.0, 180.0, 1.0, animatable=True, editor="angle", unit="degrees", fine_step=1.0, coarse_step=5.0),
+                f("offset", "Offset", "float", 0.0, -1.0, 1.0, 0.01, animatable=True),
+                f("repeat", "Repeat", "bool", True),
+            ),
+            description="A linear black-to-white-to-black directional gradient with a sharp centre ridge.",
+            tags=("ramp", "directional", "sharp", "ridge", "tile"), accent="#6876df",
+            output_format="r16f",
+            gpu_kernel="linear_gradient.wgsl",
+        ),
+        NodeDefinition(
             "generator.radial_gradient",
             "Radial Gradient",
             "Gradients",
@@ -1527,6 +1577,8 @@ def register_generator_nodes(registry: NodeRegistry) -> None:
         "generator.constant": "grayscale",
         "generator.color": "color",
         "generator.linear_gradient": "grayscale",
+        "generator.linear_gradient_2": "grayscale",
+        "generator.linear_gradient_3": "grayscale",
         "generator.radial_gradient": "grayscale",
         "shape.shape": "grayscale",
         "shape.polygon": "grayscale",

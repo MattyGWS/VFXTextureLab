@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vfx-texture-lab"
-version = "0.50.1"
+version = "0.53.0.3"
 description = "A node-based procedural texture, material and geometry authoring tool for VFX artists."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = {text = "MIT"}
 authors = [{name = "Matty Wyett-Simmonds and contributors"}]
 dependencies = [
@@ -16,6 +16,12 @@ dependencies = [
     "Pillow>=10,<13",
     "wgpu>=0.31,<0.32",
     "rendercanvas>=2.4,<3",
+    "fast-simplification>=0.1.13,<0.2",
+    "xatlas>=0.0.11,<0.1",
+    "trimesh>=4.8,<5",
+    "embreex>=4.4,<5",
+    "scipy>=1.14,<2",
+    "scikit-image>=0.25,<0.27",
 ]
 
 [project.scripts]

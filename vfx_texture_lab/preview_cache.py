@@ -51,6 +51,12 @@ class CachedGeometryMesh:
     mesh: Any
     revision: str
     dynamic: bool = False
+    node_metadata: dict[str, dict[str, Any]] | None = None
+    preview_image: np.ndarray | None = None
+    preview_material_texture: np.ndarray | None = None
+    preview_material_textures: dict[str, np.ndarray] | None = None
+    preview_details: str = ""
+    preview_kind: str = ""
 
     @property
     def bytes_used(self) -> int:
@@ -58,6 +64,15 @@ class CachedGeometryMesh:
         indices = getattr(self.geometry, "indices", None)
         total = int(vertices.nbytes) if isinstance(vertices, np.ndarray) else 0
         total += int(indices.nbytes) if isinstance(indices, np.ndarray) else 0
+        total += int(self.preview_image.nbytes) if isinstance(self.preview_image, np.ndarray) else 0
+        total += (
+            int(self.preview_material_texture.nbytes)
+            if isinstance(self.preview_material_texture, np.ndarray) else 0
+        )
+        total += sum(
+            int(array.nbytes) for array in (self.preview_material_textures or {}).values()
+            if isinstance(array, np.ndarray)
+        )
         return max(total, 64)
 
 

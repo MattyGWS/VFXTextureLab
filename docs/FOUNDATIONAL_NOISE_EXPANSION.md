@@ -111,7 +111,7 @@ A separate construction for rough, tangled fibres. A stronger secondary warp ben
 
 ### Fur
 
-Dense short tapered hairs plus a broader undercoat. Its defaults favour a consistent growth direction while **Angle Random** and Luminance Random can move it toward rough animal fur, grass-like fibres or noisy short hair.
+Dense short tapered hairs plus a broader undercoat. Each hair now uses a rounded longitudinal dome profile, avoiding the sharp midpoint ridge produced by the former mirrored-linear taper. **Density** reaches 10 and **Length** reaches 5 so a single node can create substantially fuller or longer fur. Its defaults favour a consistent growth direction while **Angle Random** and Luminance Random can move it toward rough animal fur, grass-like fibres or noisy short hair.
 
 ## Moisture Noise
 

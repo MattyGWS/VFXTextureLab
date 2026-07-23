@@ -63,6 +63,7 @@ class VFXPackageInfo:
     files: list[PackageFile] = field(default_factory=list)
     custom_nodes: list[dict[str, Any]] = field(default_factory=list)
     image_sources: list[dict[str, Any]] = field(default_factory=list)
+    mesh_sources: list[dict[str, Any]] = field(default_factory=list)
     export_templates: list[dict[str, Any]] = field(default_factory=list)
     manifest: dict[str, Any] = field(default_factory=dict)
 
@@ -83,6 +84,8 @@ class VFXPackageInfo:
             lines.append(f"Bundled custom nodes: {len(self.custom_nodes)}")
         if self.image_sources:
             lines.append(f"Included image source files: {len(self.image_sources)}")
+        if self.mesh_sources:
+            lines.append(f"Included mesh source files: {len(self.mesh_sources)}")
         if self.export_templates:
             lines.append(f"Included export templates: {len(self.export_templates)}")
         if self.description:
@@ -186,33 +189,38 @@ def _image_suffix(name: str, payload: bytes) -> str:
     return ".image"
 
 
-def _collect_packaged_image_sources(
+def _mesh_suffix(_name: str, _payload: bytes) -> str:
+    # Mesh Input currently supports Wavefront OBJ only.
+    return ".obj"
+
+
+def _collect_packaged_resource_sources(
     graph: dict[str, Any],
     *,
     entry_graph: str,
+    node_type: str,
+    resource_directory: str,
+    file_kind: str,
+    default_name: str,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, bytes]]]:
-    """Write exact imported image bytes as package resources.
-
-    The entry graph remains self-contained so it can be opened directly from
-    the archive.  These files preserve artist-editable source images for
-    extraction, inspection and later relinking.
-    """
+    """Write exact embedded Image Input or Mesh Input bytes as package files."""
 
     records_by_hash: dict[str, dict[str, Any]] = {}
     archive_path_hashes: dict[str, str] = {}
     payloads: list[tuple[str, str, bytes]] = []
     entry_parent = str(PurePosixPath(entry_graph).parent)
+    is_mesh = node_type == "input.mesh"
 
     def allocate_path(name: str, payload_hash: str, payload: bytes) -> str:
-        suffix = _image_suffix(name, payload)
-        stem = _safe_slug(Path(str(name or "image")).stem, "image")
-        candidate = f"resources/images/{stem}{suffix}"
+        suffix = _mesh_suffix(name, payload) if is_mesh else _image_suffix(name, payload)
+        stem = _safe_slug(Path(str(name or default_name)).stem, default_name)
+        candidate = f"resources/{resource_directory}/{stem}{suffix}"
         existing = archive_path_hashes.get(candidate)
         if existing is not None and existing != payload_hash:
-            candidate = f"resources/images/{stem}_{payload_hash[:8]}{suffix}"
+            candidate = f"resources/{resource_directory}/{stem}_{payload_hash[:8]}{suffix}"
         counter = 2
         while candidate in archive_path_hashes and archive_path_hashes[candidate] != payload_hash:
-            candidate = f"resources/images/{stem}_{payload_hash[:8]}_{counter}{suffix}"
+            candidate = f"resources/{resource_directory}/{stem}_{payload_hash[:8]}_{counter}{suffix}"
             counter += 1
         archive_path_hashes[candidate] = payload_hash
         return candidate
@@ -221,6 +229,16 @@ def _collect_packaged_image_sources(
         if depth > 64:
             raise VFXPackageError("Graph nesting exceeded the package safety limit.")
         graph_name = _graph_label_for_package(current, chain[-1] if chain else "Graph")
+        resource_by_id: dict[str, Mapping[str, Any]] = {}
+        resource_library = current.get("resources")
+        if isinstance(resource_library, Mapping):
+            resource_items = resource_library.get("items", resource_library.get("resources", ()))
+            if isinstance(resource_items, (list, tuple)):
+                resource_by_id = {
+                    str(item.get("uid", "")): item
+                    for item in resource_items
+                    if isinstance(item, Mapping) and str(item.get("uid", ""))
+                }
         for node in current.get("nodes", ()):
             if not isinstance(node, dict):
                 continue
@@ -229,24 +247,33 @@ def _collect_packaged_image_sources(
                 continue
             type_id = str(node.get("type", ""))
             node_name = str(parameters.get("name") or type_id or "Node")
-            if type_id == "input.image":
-                encoded = str(parameters.get("_embedded_data", "") or "").strip()
+            if type_id == node_type:
+                resource = resource_by_id.get(str(parameters.get("_resource_id", "") or ""))
+                encoded = str(
+                    parameters.get("_embedded_data", "")
+                    or (resource.get("embedded_data", "") if resource else "")
+                    or ""
+                ).strip()
+                label = "Mesh Input" if is_mesh else "Image Input"
                 if not encoded:
                     raise VFXPackageError(
-                        f"Image Input '{node_name}' has no embedded bytes to preserve as a source file."
+                        f"{label} '{node_name}' has no embedded bytes to preserve as a source file."
                     )
                 try:
                     payload = base64.b64decode(encoded, validate=True)
                 except Exception as exc:
                     raise VFXPackageError(
-                        f"Image Input '{node_name}' contains damaged embedded image data."
+                        f"{label} '{node_name}' contains damaged embedded source data."
                     ) from exc
                 payload_hash = _sha256(payload)
                 original_name = str(
                     parameters.get("_embedded_original_name")
                     or parameters.get("_embedded_name")
-                    or "image"
-                ).strip() or "image"
+                    or (resource.get("original_name") if resource else "")
+                    or (resource.get("embedded_name") if resource else "")
+                    or (resource.get("name") if resource else "")
+                    or default_name
+                ).strip() or default_name
                 record = records_by_hash.get(payload_hash)
                 if record is None:
                     member_path = allocate_path(original_name, payload_hash, payload)
@@ -258,7 +285,7 @@ def _collect_packaged_image_sources(
                         "uses": [],
                     }
                     records_by_hash[payload_hash] = record
-                    payloads.append((member_path, "image-source", payload))
+                    payloads.append((member_path, file_kind, payload))
                 relative = posixpath.relpath(str(record["path"]), start=entry_parent)
                 parameters["_packaged_source_path"] = relative
                 parameters["_packaged_source_sha256"] = payload_hash
@@ -279,6 +306,43 @@ def _collect_packaged_image_sources(
     records = sorted(records_by_hash.values(), key=lambda item: str(item["path"]).casefold())
     payloads.sort(key=lambda item: item[0].casefold())
     return records, payloads
+
+
+def _collect_packaged_image_sources(
+    graph: dict[str, Any],
+    *,
+    entry_graph: str,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, bytes]]]:
+    """Write exact imported image bytes as package resources.
+
+    The entry graph remains self-contained so it can be opened directly from
+    the archive.  These files preserve artist-editable source images for
+    extraction, inspection and later relinking.
+    """
+
+    return _collect_packaged_resource_sources(
+        graph,
+        entry_graph=entry_graph,
+        node_type="input.image",
+        resource_directory="images",
+        file_kind="image-source",
+        default_name="image",
+    )
+
+
+def _collect_packaged_mesh_sources(
+    graph: dict[str, Any],
+    *,
+    entry_graph: str,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, bytes]]]:
+    return _collect_packaged_resource_sources(
+        graph,
+        entry_graph=entry_graph,
+        node_type="input.mesh",
+        resource_directory="meshes",
+        file_kind="mesh-source",
+        default_name="mesh.obj",
+    )
 
 
 def _graph_label_for_package(data: Mapping[str, Any], fallback: str) -> str:
@@ -456,6 +520,7 @@ def create_vfxpackage(
     app_version: str = "",
     registry=None,
     include_image_sources: bool = True,
+    include_mesh_sources: bool = True,
     include_export_templates: bool = True,
 ) -> tuple[VFXPackageInfo, SelfContainedExportReport]:
     """Create and validate a .vfxpackage without modifying the source graph."""
@@ -482,9 +547,16 @@ def create_vfxpackage(
         image_sources, image_source_files = _collect_packaged_image_sources(
             portable, entry_graph=entry_graph
         )
+    mesh_sources: list[dict[str, Any]] = []
+    mesh_source_files: list[tuple[str, str, bytes]] = []
+    if include_mesh_sources:
+        mesh_sources, mesh_source_files = _collect_packaged_mesh_sources(
+            portable, entry_graph=entry_graph
+        )
     graph_bytes = json.dumps(portable, indent=2, ensure_ascii=False).encode("utf-8")
     files: list[tuple[str, str, bytes]] = [(entry_graph, "graph", graph_bytes)]
     files.extend(image_source_files)
+    files.extend(mesh_source_files)
     export_templates: list[dict[str, Any]] = []
     if include_export_templates:
         export_templates, export_template_files = _collect_graph_export_templates(portable)
@@ -527,6 +599,8 @@ def create_vfxpackage(
         "portable_mode": "single-file",
         "image_source_mode": "included-with-embedded-fallback" if include_image_sources else "embedded-only",
         "image_sources": image_sources,
+        "mesh_source_mode": "included-with-embedded-fallback" if include_mesh_sources else "embedded-only",
+        "mesh_sources": mesh_sources,
         "export_templates": export_templates,
         "custom_nodes": custom_nodes,
         "files": file_entries,
@@ -763,6 +837,44 @@ def inspect_vfxpackage(
                 "Image source inventory does not match packaged files:\n" + "\n".join(mismatch)
             )
 
+        mesh_sources_raw = manifest.get("mesh_sources", [])
+        if not isinstance(mesh_sources_raw, list):
+            raise VFXPackageError("Package mesh_sources inventory must be a list.")
+        mesh_sources: list[dict[str, Any]] = []
+        mesh_source_paths: set[str] = set()
+        for record in mesh_sources_raw:
+            if not isinstance(record, Mapping):
+                raise VFXPackageError("Package mesh_sources inventory contains an invalid entry.")
+            member_text = str(record.get("path") or "")
+            _safe_member_path(member_text)
+            if member_text in mesh_source_paths:
+                raise VFXPackageError(f"Package mesh_sources lists a duplicate file: {member_text}")
+            mesh_source_paths.add(member_text)
+            file_entry = file_by_path.get(member_text)
+            if file_entry is None or file_entry.kind != "mesh-source":
+                raise VFXPackageError(
+                    f"Packaged mesh source is not declared as a mesh-source file: {member_text}"
+                )
+            expected_hash = str(record.get("sha256") or "").lower()
+            if expected_hash != file_entry.sha256:
+                raise VFXPackageError(
+                    f"Packaged mesh source hash does not match the file inventory: {member_text}"
+                )
+            if int(record.get("size", -1)) != file_entry.size:
+                raise VFXPackageError(
+                    f"Packaged mesh source size does not match the file inventory: {member_text}"
+                )
+            uses = record.get("uses", ())
+            if not isinstance(uses, list):
+                raise VFXPackageError(f"Packaged mesh source has an invalid uses list: {member_text}")
+            mesh_sources.append(dict(record))
+        declared_mesh_paths = {entry.path for entry in files if entry.kind == "mesh-source"}
+        if declared_mesh_paths != mesh_source_paths:
+            mismatch = sorted(declared_mesh_paths ^ mesh_source_paths)
+            raise VFXPackageError(
+                "Mesh source inventory does not match packaged files:\n" + "\n".join(mismatch)
+            )
+
         export_templates_raw = manifest.get("export_templates", ())
         if not isinstance(export_templates_raw, list):
             raise VFXPackageError("Package export_templates inventory must be a list.")
@@ -863,6 +975,7 @@ def inspect_vfxpackage(
             files=files,
             custom_nodes=custom_nodes,
             image_sources=image_sources,
+            mesh_sources=mesh_sources,
             export_templates=export_templates,
             manifest=dict(manifest),
         )
@@ -1054,6 +1167,7 @@ def installed_packages(graph_asset_root: str | Path, *, asset_id: str = "") -> l
                     files=files,
                     custom_nodes=[dict(entry) for entry in manifest.get("custom_nodes", ()) if isinstance(entry, Mapping)],
                     image_sources=[dict(entry) for entry in manifest.get("image_sources", ()) if isinstance(entry, Mapping)],
+                    mesh_sources=[dict(entry) for entry in manifest.get("mesh_sources", ()) if isinstance(entry, Mapping)],
                     export_templates=[dict(entry) for entry in manifest.get("export_templates", ()) if isinstance(entry, Mapping)],
                     manifest=dict(manifest),
                 )

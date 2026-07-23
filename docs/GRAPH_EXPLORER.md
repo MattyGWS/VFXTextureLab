@@ -1,6 +1,6 @@
-# Graph Explorer and exact output previewing
+# Graph Explorer, graph resources and exact output previewing
 
-VFX Texture Lab 0.42.0 adds a multi-document graph workspace and lets the 2D Preview lock to one exact output socket. Together these features make nested `.vfxgraph` assets practical to author, inspect and compose without repeatedly saving, reopening or wiring temporary preview nodes.
+Graph Explorer began as the 0.42.0 multi-document graph workspace. In 0.51.0 each graph also becomes the parent of its imported image and mesh resources, with virtual folders for graph-local organisation. Exact output previewing and nested `.vfxgraph` editing remain unchanged.
 
 ## Preview one exact output
 
@@ -46,6 +46,22 @@ The panel is separate from Node Library:
 - **Node Library / Graph Assets** is the persistent searchable collection of reusable built-in nodes and registered asset files.
 
 The dock can be resized, hidden, floated, tabbed or moved like every other workspace panel.
+
+## Image and mesh resources
+
+Expand a graph entry to see its imported Image Input and Mesh Input resources. Multiple nodes using the same source appear as one resource with a usage count. Linked, embedded and missing states are shown centrally instead of being discoverable only by inspecting individual nodes.
+
+Double-clicking a resource activates its graph and selects every node that uses it. Resources are not draggable as graph instances; only top-level graph entries retain graph drag behaviour.
+
+Right-click a resource to select its uses, relink or replace the source, embed it in the graph, restore embedded bytes to disk, reveal the source, rename the display entry, move it to a virtual folder or remove it when unused. Relinking or embedding through Explorer updates all nodes sharing that resource. Directly assigning a different source to only one shared node safely separates that node into the matching resource instead.
+
+Existing Image Input nodes migrate automatically when an older graph is loaded. Their paths and embedded data remain valid; the new resource identity is added around the established node workflow. Mesh Input uses the same linked/embedded resource model for Wavefront OBJ files.
+
+## Virtual resource folders
+
+Use **Folder +**, or the graph/folder context menu, to create nested virtual folders beneath a graph. The hierarchy is stored in the `.vfxgraph` but never moves, renames or deletes files on disk.
+
+Default **Images** and **Meshes** folders are created when those resource types first appear. Folders and resources may be renamed and reorganised freely. Removing a folder reparents its children and resources to the removed folder's parent.
 
 ## Opening and switching graphs
 
@@ -132,6 +148,7 @@ Right-click a graph entry for:
 - Save
 - Save As
 - Save a Copy
+- New Resource Folder
 - Duplicate Graph
 - Reload from Disk
 - Reveal in File Manager

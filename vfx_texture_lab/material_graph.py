@@ -32,6 +32,7 @@ MATERIAL_PRODUCER_TYPES = frozenset(
         "material.switch",
         "material.crop",
         "material.make_it_tile_photo",
+        "geometry.bake_high_to_low",
     }
 )
 
@@ -593,6 +594,23 @@ class MaterialEvaluationSession:
                     dict(inherited.settings),
                     tuple(dict.fromkeys(warnings)),
                 )
+            elif type_id == "geometry.bake_high_to_low":
+                settings = material_settings({
+                    "name": str(node.parameters.get("name", "High to Low Bake") or "High to Low Bake"),
+                    "surface_mode": "Opaque",
+                    "two_sided": False,
+                    "normal_strength": 1.0,
+                    "normal_y": str(node.parameters.get("normal_y", "OpenGL (+Y)")),
+                    "derive_normals": False,
+                })
+                if not node.parameters.get("_manual_result_data"):
+                    warnings.append("High-to-low bake has not been run yet.")
+                info = ResolvedMaterialInfo(
+                    resolved_uid,
+                    str(node.parameters.get("name", "High to Low Bake") or "High to Low Bake"),
+                    settings,
+                    tuple(warnings),
+                )
             else:
                 info = ResolvedMaterialInfo(resolved_uid, node.definition.name, material_settings({}))
             self._settings_cache[resolved_uid] = info
@@ -644,6 +662,8 @@ class MaterialEvaluationSession:
                 result = self._evaluate_material_filter(
                     resolved_uid, node, channel, eval_make_it_tile_photo, "made seamless"
                 )
+            elif type_id == "geometry.bake_high_to_low":
+                result = self._evaluate_baked_material(resolved_uid, node, channel)
             else:
                 result = MaterialChannelResult(
                     self._default_image(channel), False, MATERIAL_CHANNEL_KINDS[channel], backends={"Defaults"}
@@ -702,6 +722,31 @@ class MaterialEvaluationSession:
         return MaterialChannelResult(
             output, True, MATERIAL_CHANNEL_KINDS[channel], **stats
         )
+
+    def _evaluate_baked_material(self, uid: str, node: Any, channel: str) -> MaterialChannelResult:
+        output_name = {
+            "Base Colour": "Albedo",
+            "Normal": "Normal",
+            "Height": "Height",
+            "Ambient Occlusion": "Ambient Occlusion",
+        }.get(channel)
+        if output_name is None:
+            return MaterialChannelResult(
+                self._default_image(channel), False, MATERIAL_CHANNEL_KINDS[channel],
+                backends={"Defaults"},
+            )
+        from .geometry_bake import bake_result_map_names
+        if output_name not in bake_result_map_names(node.parameters):
+            return MaterialChannelResult(
+                self._default_image(channel), False, MATERIAL_CHANNEL_KINDS[channel],
+                backends={"Defaults"},
+            )
+        result = self._evaluate_image_reference(
+            (uid, output_name), label=f"{node.definition.name} · {output_name}", owner_uid=uid
+        )
+        result.present = True
+        result.data_kind = MATERIAL_CHANNEL_KINDS[channel]
+        return result
 
     def _evaluate_pbr(self, uid: str, node: Any, channel: str) -> MaterialChannelResult:
         source = self._source_for_material_channel(uid, channel)
@@ -971,6 +1016,15 @@ def material_channel_present(
         if type_id in {"material.crop", "material.make_it_tile_photo"}:
             base = snapshot.inputs.get((producer_uid, "Material"))
             return material_channel_present(snapshot, base[0] if base else None, channel, stack)
+        if type_id == "geometry.bake_high_to_low":
+            from .geometry_bake import bake_result_map_names
+            output_name = {
+                "Base Colour": "Albedo",
+                "Normal": "Normal",
+                "Height": "Height",
+                "Ambient Occlusion": "Ambient Occlusion",
+            }.get(channel)
+            return bool(output_name and output_name in bake_result_map_names(node.parameters))
         return False
     finally:
         stack.discard(key)

@@ -8,12 +8,42 @@ processing nodes and exporters.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from array import array
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, MutableMapping
 
+import base64
+import binascii
+import hashlib
+import io
 import math
+import threading
 import numpy as np
+
+
+UV_ORIGIN_TOP_LEFT = "top-left"
+UV_ORIGIN_BOTTOM_LEFT = "bottom-left"
+
+
+def normalise_uv_origin(value: str | None) -> str:
+    text = str(value or UV_ORIGIN_TOP_LEFT).strip().casefold().replace("_", "-")
+    if text in {"bottom-left", "bottomleft", "v-up", "standard", "obj"}:
+        return UV_ORIGIN_BOTTOM_LEFT
+    return UV_ORIGIN_TOP_LEFT
+
+
+def convert_uv_origin(vertices: np.ndarray, source: str, target: str) -> np.ndarray:
+    """Return vertices expressed in the requested UV vertical-origin convention."""
+    source_origin = normalise_uv_origin(source)
+    target_origin = normalise_uv_origin(target)
+    values = np.asarray(vertices, dtype=np.float32)
+    if source_origin == target_origin:
+        return values
+    converted = np.ascontiguousarray(values.copy(), dtype=np.float32)
+    converted[:, 7] = 1.0 - converted[:, 7]
+    return converted
 
 
 @dataclass(slots=True)
@@ -27,10 +57,12 @@ class GeometryData:
     vertices: np.ndarray
     indices: np.ndarray
     name: str = "Geometry"
+    uv_origin: str = UV_ORIGIN_TOP_LEFT
 
     def __post_init__(self) -> None:
         self.vertices = np.ascontiguousarray(self.vertices, dtype=np.float32).reshape(-1, 8)
         self.indices = np.ascontiguousarray(self.indices, dtype=np.uint32).reshape(-1)
+        self.uv_origin = normalise_uv_origin(self.uv_origin)
         if self.indices.size % 3:
             raise ValueError("Geometry indices must describe triangles")
         if self.indices.size and int(self.indices.max()) >= self.vertices.shape[0]:
@@ -55,7 +87,415 @@ class GeometryData:
         return positions.min(axis=0), positions.max(axis=0)
 
     def copy(self, *, name: str | None = None) -> "GeometryData":
-        return GeometryData(self.vertices.copy(), self.indices.copy(), name or self.name)
+        return GeometryData(
+            self.vertices.copy(), self.indices.copy(), name or self.name, self.uv_origin
+        )
+
+    def vertices_with_uv_origin(self, target: str) -> np.ndarray:
+        return convert_uv_origin(self.vertices, self.uv_origin, target)
+
+
+class GeometryEvaluationCancelled(RuntimeError):
+    """Raised when a background geometry request has been superseded."""
+
+
+@dataclass(slots=True)
+class GeometryEvalContext:
+    """Cooperative callbacks available to expensive geometry evaluators."""
+
+    node_uid: str = ""
+    node_name: str = "Geometry"
+    cancel_check: Callable[[], bool] | None = None
+    progress_callback: Callable[[int, int, str], None] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    width: int = 1024
+    height: int = 1024
+    preview_options: dict[str, Any] = field(default_factory=dict)
+    preview_image: np.ndarray | None = None
+    preview_material_texture: np.ndarray | None = None
+    preview_material_textures: dict[str, np.ndarray] = field(default_factory=dict)
+    preview_details: str = ""
+    preview_kind: str = ""
+    render_mode: str = "preview_3d"
+
+    def checkpoint(self) -> None:
+        if self.cancel_check is not None and self.cancel_check():
+            raise GeometryEvaluationCancelled(f"{self.node_name} evaluation was cancelled")
+
+    def progress(self, current: int, total: int, message: str) -> None:
+        self.checkpoint()
+        if self.progress_callback is not None:
+            self.progress_callback(int(current), int(total), str(message or self.node_name))
+
+    def report_metadata(self, values: Mapping[str, Any]) -> None:
+        self.metadata.update(dict(values))
+
+
+
+
+_OBJ_CACHE: "OrderedDict[tuple[Any, ...], tuple[GeometryData, dict[str, Any], int]]" = OrderedDict()
+_OBJ_CACHE_LOCK = threading.RLock()
+_OBJ_CACHE_BUDGET = 768 * 1024 * 1024
+_DEFERRED_METADATA_BYTES = 32 * 1024 * 1024
+
+
+def _mesh_source_bytes_or_path(parameters: Mapping[str, Any]):
+    encoded = str(parameters.get("_embedded_data", "") or "").strip()
+    if encoded:
+        try:
+            return io.BytesIO(base64.b64decode(encoded, validate=True))
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Embedded OBJ data is damaged") from exc
+    path = Path(str(parameters.get("path", "") or "")).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"OBJ source not found: {path}")
+    return path
+
+
+def _mesh_source_cache_key(parameters: Mapping[str, Any]) -> tuple[tuple[Any, ...], int]:
+    encoded = str(parameters.get("_embedded_data", "") or "").strip()
+    if encoded:
+        digest = hashlib.blake2b(encoded.encode("ascii", errors="ignore"), digest_size=16).hexdigest()
+        estimated = (len(encoded) * 3) // 4
+        return ("embedded", digest, len(encoded)), estimated
+    path = Path(str(parameters.get("path", "") or "")).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"OBJ source not found: {path}")
+    stat = path.stat()
+    return ("path", str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)), int(stat.st_size)
+
+
+def _obj_cache_get(key: tuple[Any, ...]) -> tuple[GeometryData, dict[str, Any]] | None:
+    with _OBJ_CACHE_LOCK:
+        value = _OBJ_CACHE.get(key)
+        if value is None:
+            return None
+        _OBJ_CACHE.move_to_end(key)
+        geometry, metadata, _bytes_used = value
+        return GeometryData(geometry.vertices, geometry.indices, geometry.name, geometry.uv_origin), dict(metadata)
+
+
+def _obj_cache_put(key: tuple[Any, ...], geometry: GeometryData, metadata: Mapping[str, Any]) -> None:
+    bytes_used = int(geometry.vertices.nbytes + geometry.indices.nbytes)
+    with _OBJ_CACHE_LOCK:
+        _OBJ_CACHE[key] = (geometry, dict(metadata), bytes_used)
+        _OBJ_CACHE.move_to_end(key)
+        total = sum(item[2] for item in _OBJ_CACHE.values())
+        while total > _OBJ_CACHE_BUDGET and len(_OBJ_CACHE) > 1:
+            _old_key, old = _OBJ_CACHE.popitem(last=False)
+            total -= old[2]
+
+
+def _obj_index(value: str, count: int, label: str, line_number: int) -> int:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid OBJ {label} index on line {line_number}") from exc
+    if raw == 0:
+        raise ValueError(f"OBJ {label} index 0 is invalid on line {line_number}")
+    resolved = raw - 1 if raw > 0 else count + raw
+    if resolved < 0 or resolved >= count:
+        raise ValueError(f"OBJ {label} index {raw} is out of range on line {line_number}")
+    return resolved
+
+
+def _parse_obj_lines(
+    lines,
+    *,
+    fallback_name: str = "Imported Mesh",
+    total_bytes: int = 0,
+    context: GeometryEvalContext | None = None,
+) -> tuple[GeometryData, dict[str, Any]]:
+    """Stream a Wavefront OBJ into compact arrays.
+
+    The previous importer decoded the whole file, retained every polygon corner
+    in Python tuples, and then constructed the output in a second pass. That was
+    tolerable for small assets but multiplied memory use for photogrammetry
+    scans. This parser creates interleaved seam vertices and triangles as lines
+    arrive, keeping peak memory much closer to the final mesh size.
+    """
+
+    positions = array("f")
+    texcoords = array("f")
+    normals = array("f")
+    output_positions = array("f")
+    output_uvs = array("f")
+    output_normals = array("f")
+    output_position_indices = array("I")
+    output_indices = array("I")
+    vertex_map: dict[tuple[int, int | None, int | None], int] = {}
+    object_names: list[str] = []
+    object_name_set: set[str] = set()
+    has_uvs = True
+    has_normals = True
+    triangle_count = 0
+    bytes_seen = 0
+
+    def position_value(index: int) -> tuple[float, float, float]:
+        offset = index * 3
+        return positions[offset], positions[offset + 1], positions[offset + 2]
+
+    def uv_value(index: int | None) -> tuple[float, float]:
+        if index is None:
+            return 0.0, 0.0
+        offset = index * 2
+        return texcoords[offset], texcoords[offset + 1]
+
+    def normal_value(index: int | None) -> tuple[float, float, float]:
+        if index is None:
+            return 0.0, 0.0, 0.0
+        offset = index * 3
+        return normals[offset], normals[offset + 1], normals[offset + 2]
+
+    for line_number, raw_line in enumerate(lines, 1):
+        if context is not None and (line_number & 8191) == 0:
+            context.checkpoint()
+            if total_bytes > 0:
+                # Character count is an intentionally cheap approximation; OBJ
+                # numeric syntax is overwhelmingly ASCII.
+                context.progress(min(bytes_seen, total_bytes), total_bytes, "Importing OBJ mesh")
+            else:
+                context.progress(line_number, 0, "Importing OBJ mesh")
+        bytes_seen += len(raw_line)
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        keyword = parts[0].casefold()
+        values = parts[1:]
+        if keyword == "v":
+            if len(values) < 3:
+                raise ValueError(f"OBJ vertex on line {line_number} has fewer than three coordinates")
+            try:
+                positions.extend((float(values[0]), float(values[1]), float(values[2])))
+            except ValueError as exc:
+                raise ValueError(f"Invalid OBJ vertex on line {line_number}") from exc
+        elif keyword == "vt":
+            if len(values) < 2:
+                raise ValueError(f"OBJ texture coordinate on line {line_number} has fewer than two values")
+            try:
+                texcoords.extend((float(values[0]), float(values[1])))
+            except ValueError as exc:
+                raise ValueError(f"Invalid OBJ texture coordinate on line {line_number}") from exc
+        elif keyword == "vn":
+            if len(values) < 3:
+                raise ValueError(f"OBJ normal on line {line_number} has fewer than three coordinates")
+            try:
+                normals.extend((float(values[0]), float(values[1]), float(values[2])))
+            except ValueError as exc:
+                raise ValueError(f"Invalid OBJ normal on line {line_number}") from exc
+        elif keyword in {"o", "g"} and values:
+            name = " ".join(values).strip()
+            if name and name not in object_name_set:
+                object_name_set.add(name)
+                object_names.append(name)
+        elif keyword == "f":
+            if len(values) < 3:
+                raise ValueError(f"OBJ face on line {line_number} has fewer than three corners")
+            corners: list[tuple[int, int | None, int | None]] = []
+            position_count = len(positions) // 3
+            uv_count = len(texcoords) // 2
+            normal_count = len(normals) // 3
+            for token in values:
+                fields = token.split("/")
+                if not fields or not fields[0]:
+                    raise ValueError(f"OBJ face corner on line {line_number} has no position index")
+                position_index = _obj_index(fields[0], position_count, "position", line_number)
+                uv_index = None
+                normal_index = None
+                if len(fields) > 1 and fields[1]:
+                    uv_index = _obj_index(fields[1], uv_count, "UV", line_number)
+                else:
+                    has_uvs = False
+                if len(fields) > 2 and fields[2]:
+                    normal_index = _obj_index(fields[2], normal_count, "normal", line_number)
+                else:
+                    has_normals = False
+                corners.append((position_index, uv_index, normal_index))
+
+            for fan_index in range(1, len(corners) - 1):
+                triangle_count += 1
+                if triangle_count > 5_000_000:
+                    raise ValueError("OBJ exceeds the five-million-triangle import safety limit")
+                for corner in (corners[0], corners[fan_index], corners[fan_index + 1]):
+                    output_index = vertex_map.get(corner)
+                    if output_index is None:
+                        output_index = len(output_position_indices)
+                        vertex_map[corner] = output_index
+                        position_index, uv_index, normal_index = corner
+                        output_positions.extend(position_value(position_index))
+                        output_position_indices.append(position_index)
+                        output_uvs.extend(uv_value(uv_index))
+                        output_normals.extend(normal_value(normal_index))
+                    output_indices.append(output_index)
+
+    if context is not None:
+        context.checkpoint()
+    if not positions:
+        raise ValueError("OBJ contains no vertex positions")
+    if not output_indices:
+        raise ValueError("OBJ contains no polygon faces")
+
+    positions_array = np.frombuffer(output_positions, dtype=np.float32).reshape(-1, 3)
+    uvs_array = np.frombuffer(output_uvs, dtype=np.float32).reshape(-1, 2)
+    indices_array = np.frombuffer(output_indices, dtype=np.uint32)
+
+    if has_normals:
+        normals_array = np.frombuffer(output_normals, dtype=np.float32).reshape(-1, 3).copy()
+        lengths = np.linalg.norm(normals_array, axis=1, keepdims=True)
+        normals_array /= np.maximum(lengths, 1.0e-8)
+    else:
+        if context is not None:
+            context.progress(1, 3, "Generating smooth import normals")
+        original_position_count = len(positions) // 3
+        position_accum = np.zeros((original_position_count, 3), dtype=np.float64)
+        tri_indices = indices_array.reshape(-1, 3)
+        points = positions_array[tri_indices]
+        face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]).astype(np.float64)
+        position_ids = np.frombuffer(output_position_indices, dtype=np.uint32).astype(np.int64, copy=False)
+        triangle_position_ids = position_ids[tri_indices]
+        np.add.at(position_accum, triangle_position_ids[:, 0], face_normals)
+        np.add.at(position_accum, triangle_position_ids[:, 1], face_normals)
+        np.add.at(position_accum, triangle_position_ids[:, 2], face_normals)
+        lengths = np.linalg.norm(position_accum, axis=1, keepdims=True)
+        smooth = position_accum / np.maximum(lengths, 1.0e-12)
+        smooth[lengths[:, 0] <= 1.0e-12] = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+        normals_array = smooth[position_ids].astype(np.float32)
+
+    mesh_name = object_names[0] if object_names else str(fallback_name or "Imported Mesh")
+    geometry = _interleaved_geometry(
+        positions_array,
+        normals_array,
+        uvs_array,
+        indices_array,
+        mesh_name,
+        uv_origin=UV_ORIGIN_BOTTOM_LEFT,
+    )
+    if context is not None:
+        context.progress(2, 3, "Diagnosing imported mesh topology")
+    from .mesh_processing import diagnose_mesh
+
+    diagnostics = diagnose_mesh(
+        geometry.vertices,
+        geometry.indices,
+        cancel_check=context.cancel_check if context is not None else None,
+    )
+    metadata = {
+        "vertex_count": geometry.vertex_count,
+        "triangle_count": geometry.triangle_count,
+        "has_uvs": bool(has_uvs),
+        "has_normals": bool(has_normals),
+        "object_count": max(len(object_names), 1),
+        "name": mesh_name,
+        **diagnostics.as_metadata(),
+    }
+    if context is not None:
+        context.progress(3, 3, "OBJ import complete")
+    return geometry, metadata
+
+
+def _parse_obj_text(
+    text: str,
+    *,
+    fallback_name: str = "Imported Mesh",
+    context: GeometryEvalContext | None = None,
+) -> tuple[GeometryData, dict[str, Any]]:
+    return _parse_obj_lines(
+        io.StringIO(text),
+        fallback_name=fallback_name,
+        total_bytes=len(text),
+        context=context,
+    )
+
+
+def load_obj_geometry(
+    parameters: Mapping[str, Any],
+    context: GeometryEvalContext | None = None,
+) -> tuple[GeometryData, dict[str, Any]]:
+    key, source_bytes = _mesh_source_cache_key(parameters)
+    cached = _obj_cache_get(key)
+    if cached is not None:
+        if context is not None:
+            context.progress(1, 1, "Reusing cached OBJ geometry")
+        return cached
+
+    source = _mesh_source_bytes_or_path(parameters)
+    if isinstance(source, Path):
+        fallback_name = source.stem
+        # Numeric OBJ data is ASCII. Replacement decoding only affects unusual
+        # object/group names and lets legacy local encodings stream safely.
+        with source.open("r", encoding="utf-8-sig", errors="replace", newline=None) as handle:
+            geometry, metadata = _parse_obj_lines(
+                handle,
+                fallback_name=fallback_name,
+                total_bytes=source_bytes,
+                context=context,
+            )
+    else:
+        fallback_name = Path(str(parameters.get("_embedded_name", "") or "Imported Mesh")).stem
+        wrapper = io.TextIOWrapper(source, encoding="utf-8-sig", errors="replace", newline=None)
+        try:
+            geometry, metadata = _parse_obj_lines(
+                wrapper,
+                fallback_name=fallback_name,
+                total_bytes=source_bytes,
+                context=context,
+            )
+        finally:
+            wrapper.detach()
+    _obj_cache_put(key, geometry, metadata)
+    return GeometryData(geometry.vertices, geometry.indices, geometry.name, geometry.uv_origin), dict(metadata)
+
+
+def _mesh_metadata_parameters(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    names = (
+        "vertex_count", "triangle_count", "has_uvs", "has_normals", "object_count",
+        "name", "unique_position_count", "boundary_edges", "non_manifold_edges",
+        "degenerate_triangles", "duplicate_triangles", "connected_components",
+        "uv_seam_vertices", "hard_normal_seam_vertices", "memory_bytes",
+        "closed_manifold",
+    )
+    return {
+        f"_source_{name}": metadata[name]
+        for name in names
+        if name in metadata
+    }
+
+
+def refresh_mesh_metadata(parameters: MutableMapping[str, Any] | dict[str, Any]) -> None:
+    """Refresh Mesh Input information without blocking on giant scan files."""
+
+    try:
+        _key, source_bytes = _mesh_source_cache_key(parameters)
+        parameters["_source_file_bytes"] = int(source_bytes)
+        if source_bytes >= _DEFERRED_METADATA_BYTES:
+            parameters["_source_pending"] = True
+            parameters.pop("_source_error", None)
+            return
+        _geometry, metadata = load_obj_geometry(parameters)
+        parameters.update(_mesh_metadata_parameters(metadata))
+        parameters["_source_pending"] = False
+        parameters.pop("_source_error", None)
+    except Exception as exc:
+        for key in tuple(parameters):
+            if key.startswith("_source_") and key not in {"_source_mode", "_source_path"}:
+                parameters.pop(key, None)
+        parameters["_source_error"] = str(exc)
+
+
+def evaluate_mesh_input_geometry(
+    _inputs: Mapping[str, GeometryData],
+    parameters: Mapping[str, Any],
+    context: GeometryEvalContext | None = None,
+) -> GeometryData:
+    geometry, metadata = load_obj_geometry(parameters, context=context)
+    if context is not None:
+        context.report_metadata(_mesh_metadata_parameters(metadata))
+        context.report_metadata({"_source_pending": False, "_source_error": ""})
+    requested_name = str(parameters.get("name", "") or "").strip()
+    if requested_name:
+        geometry.name = requested_name
+    return geometry
 
 
 def _interleaved_geometry(
@@ -64,9 +504,11 @@ def _interleaved_geometry(
     uvs: np.ndarray,
     indices: np.ndarray,
     name: str,
+    *,
+    uv_origin: str = UV_ORIGIN_TOP_LEFT,
 ) -> GeometryData:
     vertices = np.concatenate((positions, normals, uvs), axis=1)
-    return GeometryData(vertices, indices, name)
+    return GeometryData(vertices, indices, name, uv_origin)
 
 
 def _shift_to_positive_bounds(positions: np.ndarray) -> np.ndarray:
@@ -962,7 +1404,7 @@ def bend_geometry(
         raise TypeError("Geometry Bend requires a connected Geometry input")
     vertices = geometry.vertices.copy()
     if not vertices.size or abs(float(amount)) <= 1.0e-8:
-        return GeometryData(vertices, geometry.indices.copy(), name)
+        return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
     positions = vertices[:, :3]
     normals = vertices[:, 3:6]
@@ -987,7 +1429,7 @@ def bend_geometry(
     maximum = float(coordinate.max())
     extent = maximum - minimum
     if extent <= 1.0e-8:
-        return GeometryData(vertices, geometry.indices.copy(), name)
+        return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
     start_amount, end_amount = _normalised_range(range_start, range_end)
     start = minimum + extent * start_amount
@@ -996,7 +1438,7 @@ def bend_geometry(
     total_angle = math.radians(float(amount))
     curvature = total_angle / section_length
     if abs(curvature) <= 1.0e-10:
-        return GeometryData(vertices, geometry.indices.copy(), name)
+        return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
     local = coordinate - start
     if clamp_outside:
@@ -1025,7 +1467,7 @@ def bend_geometry(
     vertices[:, 3:6] = _normalised(
         _rotate_about_axis(normals, binormal, theta), fallback=normals
     )
-    return GeometryData(vertices, geometry.indices.copy(), name)
+    return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
 
 def twist_geometry(
@@ -1045,7 +1487,7 @@ def twist_geometry(
         raise TypeError("Geometry Twist requires a connected Geometry input")
     vertices = geometry.vertices.copy()
     if not vertices.size or abs(float(amount)) <= 1.0e-8:
-        return GeometryData(vertices, geometry.indices.copy(), name)
+        return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
     positions = vertices[:, :3]
     normals = vertices[:, 3:6]
     twist_axis = _axis_vector(axis)
@@ -1056,7 +1498,7 @@ def twist_geometry(
     maximum = float(coordinate.max())
     extent = maximum - minimum
     if extent <= 1.0e-8:
-        return GeometryData(vertices, geometry.indices.copy(), name)
+        return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
     start_amount, end_amount = _normalised_range(range_start, range_end)
     start = minimum + extent * start_amount
@@ -1073,7 +1515,7 @@ def twist_geometry(
     vertices[:, 3:6] = _normalised(
         _rotate_about_axis(normals, twist_axis, angles), fallback=normals
     )
-    return GeometryData(vertices, geometry.indices.copy(), name)
+    return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
 
 def uv_transform_geometry(
@@ -1115,7 +1557,7 @@ def uv_transform_geometry(
         + pivot
         + np.asarray((float(offset_u), float(offset_v)), dtype=np.float32)
     )
-    return GeometryData(vertices, geometry.indices.copy(), name)
+    return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
 
 def _drop_degenerate_triangles(indices: np.ndarray, positions: np.ndarray) -> np.ndarray:
@@ -1216,7 +1658,7 @@ def clean_weld_geometry(
             vertices = np.empty((0, 8), dtype=np.float32)
             indices = np.empty((0,), dtype=np.uint32)
 
-    return GeometryData(vertices, indices, name)
+    return GeometryData(vertices, indices, name, geometry.uv_origin)
 
 
 def combine_geometry(
@@ -1235,12 +1677,13 @@ def combine_geometry(
 
     if not isinstance(bottom, GeometryData) or not isinstance(top, GeometryData):
         raise TypeError("Geometry Combine requires connected Bottom and Top Geometry inputs")
-    vertices = np.concatenate((bottom.vertices, top.vertices), axis=0)
+    top_vertices = convert_uv_origin(top.vertices, top.uv_origin, bottom.uv_origin)
+    vertices = np.concatenate((bottom.vertices, top_vertices), axis=0)
     top_indices = top.indices.astype(np.uint64, copy=False) + bottom.vertex_count
     if top_indices.size and int(top_indices.max()) > np.iinfo(np.uint32).max:
         raise ValueError("Combined geometry exceeds the uint32 index limit")
     indices = np.concatenate((bottom.indices, top_indices.astype(np.uint32)), axis=0)
-    return GeometryData(vertices, indices, name)
+    return GeometryData(vertices, indices, name, bottom.uv_origin)
 
 def transform_geometry(
     geometry: GeometryData,
@@ -1298,7 +1741,7 @@ def transform_geometry(
         indices = triangles.reshape(-1)
     vertices[:, :3] = transformed
     vertices[:, 3:6] = transformed_normals
-    return GeometryData(vertices, indices, name)
+    return GeometryData(vertices, indices, name, geometry.uv_origin)
 
 
 def _normalised(values: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
@@ -1414,6 +1857,7 @@ def _subdivide_once(geometry: GeometryData) -> GeometryData:
         np.asarray(vertices, dtype=np.float32),
         np.asarray(indices, dtype=np.uint32),
         geometry.name,
+        geometry.uv_origin,
     )
 
 
@@ -1442,10 +1886,902 @@ def subdivide_geometry(
             vertices = result.vertices.copy()
             vertices[:, :3] = _relax_geometry_positions(vertices[:, :3], result.indices, 0.5)
             vertices[:, 3:6] = _smooth_vertex_normals(vertices[:, :3], result.indices)
-            result = GeometryData(vertices, result.indices.copy(), name)
+            result = GeometryData(vertices, result.indices.copy(), name, result.uv_origin)
     result.name = name
     return result
 
+
+
+def _triangle_rows_without_duplicates(indices: np.ndarray) -> np.ndarray:
+    """Drop repeated triangles while retaining the first triangle's winding."""
+
+    triangles = np.asarray(indices, dtype=np.uint32).reshape(-1, 3)
+    if not triangles.size:
+        return np.empty((0,), dtype=np.uint32)
+    canonical = np.sort(triangles, axis=1)
+    packed = np.ascontiguousarray(canonical).view(
+        np.dtype((np.void, canonical.dtype.itemsize * canonical.shape[1]))
+    ).reshape(-1)
+    _, first = np.unique(packed, return_index=True)
+    first.sort()
+    return np.ascontiguousarray(triangles[first].reshape(-1), dtype=np.uint32)
+
+
+def _decimation_face_data(
+    vertices: np.ndarray, indices: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    triangles = np.asarray(indices, dtype=np.uint32).reshape(-1, 3)
+    positions = vertices[:, :3]
+    p0 = positions[triangles[:, 0]]
+    p1 = positions[triangles[:, 1]]
+    p2 = positions[triangles[:, 2]]
+    raw_normals = np.cross(p1 - p0, p2 - p0)
+    lengths = np.linalg.norm(raw_normals, axis=1)
+    unit_normals = raw_normals / np.maximum(lengths[:, None], 1.0e-12)
+    planes = np.concatenate(
+        (unit_normals, -np.einsum("ij,ij->i", unit_normals, p0)[:, None]), axis=1
+    )
+    return triangles, positions, raw_normals, lengths, unit_normals, planes
+
+
+def _decimation_edges(
+    triangles: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    triangle_count = triangles.shape[0]
+    occurrences = np.concatenate(
+        (triangles[:, (0, 1)], triangles[:, (1, 2)], triangles[:, (2, 0)]), axis=0
+    ).astype(np.uint32, copy=False)
+    occurrence_faces = np.tile(np.arange(triangle_count, dtype=np.int64), 3)
+    occurrences = np.sort(occurrences, axis=1)
+    edges, first, inverse, counts = np.unique(
+        occurrences, axis=0, return_index=True, return_inverse=True, return_counts=True
+    )
+    return edges, counts, first, inverse, occurrence_faces
+
+
+def _decimation_quadrics(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    planes: np.ndarray,
+    edges: np.ndarray,
+    edge_counts: np.ndarray,
+    edge_first: np.ndarray,
+    occurrence_faces: np.ndarray,
+) -> np.ndarray:
+    quadrics = np.zeros((vertices.shape[0], 4, 4), dtype=np.float64)
+    face_quadrics = planes[:, :, None] * planes[:, None, :]
+    for corner in range(3):
+        np.add.at(quadrics, triangles[:, corner], face_quadrics)
+
+    # Standard boundary quadrics keep open silhouettes and disconnected UV or
+    # hard-normal islands from shrinking inwards too aggressively. Imported OBJ
+    # seams already use duplicated vertices, so their edges naturally appear as
+    # boundaries to this indexed topology.
+    boundary_indices = np.flatnonzero(edge_counts == 1)
+    if boundary_indices.size:
+        positions = vertices[:, :3].astype(np.float64, copy=False)
+        boundary_edges = edges[boundary_indices]
+        boundary_faces = occurrence_faces[edge_first[boundary_indices]]
+        edge_vectors = positions[boundary_edges[:, 1]] - positions[boundary_edges[:, 0]]
+        face_normals = planes[boundary_faces, :3]
+        boundary_normals = np.cross(edge_vectors, face_normals)
+        boundary_lengths = np.linalg.norm(boundary_normals, axis=1)
+        valid = boundary_lengths > 1.0e-12
+        boundary_normals[valid] /= boundary_lengths[valid, None]
+        boundary_planes = np.zeros((boundary_edges.shape[0], 4), dtype=np.float64)
+        boundary_planes[:, :3] = boundary_normals
+        boundary_planes[:, 3] = -np.einsum(
+            "ij,ij->i", boundary_normals, positions[boundary_edges[:, 0]]
+        )
+        boundary_quadrics = boundary_planes[:, :, None] * boundary_planes[:, None, :]
+        boundary_quadrics *= 16.0
+        for endpoint in range(2):
+            np.add.at(quadrics, boundary_edges[:, endpoint], boundary_quadrics)
+    return quadrics
+
+
+def _decimation_candidates(
+    vertices: np.ndarray,
+    indices: np.ndarray,
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    triangles, positions, raw_normals, face_lengths, _unit_normals, planes = (
+        _decimation_face_data(vertices, indices)
+    )
+    edges, edge_counts, edge_first, _edge_inverse, occurrence_faces = _decimation_edges(
+        triangles
+    )
+    manifold = edge_counts <= 2
+    edges = edges[manifold]
+    edge_counts = edge_counts[manifold]
+    edge_first = edge_first[manifold]
+    quadrics = _decimation_quadrics(
+        vertices,
+        triangles,
+        planes,
+        edges,
+        edge_counts,
+        edge_first,
+        occurrence_faces,
+    )
+
+    p0 = positions[edges[:, 0]].astype(np.float64, copy=False)
+    p1 = positions[edges[:, 1]].astype(np.float64, copy=False)
+    edge_vectors = p1 - p0
+    edge_length_squared = np.einsum("ij,ij->i", edge_vectors, edge_vectors)
+    combined = quadrics[edges[:, 0]] + quadrics[edges[:, 1]]
+
+    solved = (p0 + p1) * 0.5
+    matrices = combined[:, :3, :3]
+    offsets = combined[:, :3, 3]
+    determinants = np.linalg.det(matrices)
+    stable = np.abs(determinants) > 1.0e-12
+    if np.any(stable):
+        try:
+            solved[stable] = np.linalg.solve(matrices[stable], -offsets[stable, :, None])[:, :, 0]
+        except np.linalg.LinAlgError:
+            # Individual singular matrices can still sneak through the
+            # determinant threshold on badly scaled meshes. Midpoints are a
+            # safe deterministic fallback.
+            pass
+
+    # Keep the replacement on the original edge. It is less aggressive than
+    # unconstrained QEM but avoids surprising spikes and makes UV/normal
+    # interpolation well defined.
+    amount = np.einsum("ij,ij->i", solved - p0, edge_vectors) / np.maximum(
+        edge_length_squared, 1.0e-20
+    )
+    amount = np.clip(amount, 0.0, 1.0)
+    replacement = p0 + edge_vectors * amount[:, None]
+    homogeneous = np.concatenate(
+        (replacement, np.ones((replacement.shape[0], 1), dtype=np.float64)), axis=1
+    )
+    costs = np.einsum("ni,nij,nj->n", homogeneous, combined, homogeneous)
+
+    # Stable tie-breaking favours short edges. Attribute terms are deliberately
+    # gentle: UV and hard-normal seams are already disconnected in GeometryData,
+    # while this discourages needless collapse across rapid variation inside an
+    # otherwise connected island.
+    extent = positions.max(axis=0) - positions.min(axis=0) if positions.size else np.ones(3)
+    scale_squared = max(float(np.dot(extent, extent)), 1.0)
+    normal_dot = np.einsum(
+        "ij,ij->i", vertices[edges[:, 0], 3:6], vertices[edges[:, 1], 3:6]
+    )
+    uv_delta = vertices[edges[:, 1], 6:8] - vertices[edges[:, 0], 6:8]
+    costs += np.maximum(0.0, 1.0 - normal_dot) * scale_squared * 1.0e-5
+    costs += np.einsum("ij,ij->i", uv_delta, uv_delta) * scale_squared * 1.0e-7
+    costs += edge_length_squared * 1.0e-12
+    return (
+        triangles,
+        raw_normals,
+        face_lengths,
+        edges,
+        edge_counts,
+        amount.astype(np.float32),
+        costs,
+    )
+
+
+def _vertex_face_lists(triangles: np.ndarray, vertex_count: int) -> list[list[int]]:
+    result: list[list[int]] = [[] for _ in range(vertex_count)]
+    for face_index, triangle in enumerate(triangles):
+        result[int(triangle[0])].append(face_index)
+        result[int(triangle[1])].append(face_index)
+        result[int(triangle[2])].append(face_index)
+    return result
+
+
+def _collapse_preserves_faces(
+    u: int,
+    v: int,
+    replacement: np.ndarray,
+    triangles: np.ndarray,
+    positions: np.ndarray,
+    raw_normals: np.ndarray,
+    face_lengths: np.ndarray,
+    vertex_faces: list[list[int]],
+    minimum_area_twice: float,
+) -> bool:
+    # Validate every surviving face touched by the collapse in one small NumPy
+    # batch.  The previous implementation performed dozens of tiny np.cross /
+    # np.linalg calls and recomputed whole-mesh bounds for every candidate,
+    # which dominated high-poly decimation time.
+    affected = set(vertex_faces[u])
+    affected.update(vertex_faces[v])
+    if not affected:
+        return False
+    face_indices = np.fromiter(affected, dtype=np.int64)
+    local_triangles = triangles[face_indices]
+    has_u = np.any(local_triangles == u, axis=1)
+    has_v = np.any(local_triangles == v, axis=1)
+    surviving = ~(has_u & has_v)
+    if not np.any(surviving):
+        return True
+    face_indices = face_indices[surviving]
+    local_triangles = local_triangles[surviving]
+    points = positions[local_triangles].copy()
+    replacement_mask = (local_triangles == u) | (local_triangles == v)
+    points[replacement_mask] = replacement
+    new_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+    new_lengths = np.linalg.norm(new_normals, axis=1)
+    if np.any(new_lengths <= minimum_area_twice):
+        return False
+    old_lengths = np.maximum(face_lengths[face_indices], minimum_area_twice)
+    alignment = np.einsum('ij,ij->i', new_normals, raw_normals[face_indices])
+    return bool(np.all(alignment > old_lengths * new_lengths * 0.05))
+
+
+def _apply_decimation_batch(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    selections: list[tuple[int, int, float, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    updated = vertices.copy()
+    remap = np.arange(vertices.shape[0], dtype=np.uint32)
+    for keep, remove, amount, replacement in selections:
+        value = updated[keep].copy()
+        value[:3] = replacement
+        normal = (
+            updated[keep, 3:6] * (1.0 - amount)
+            + updated[remove, 3:6] * amount
+        )
+        length = float(np.linalg.norm(normal))
+        if length > 1.0e-8:
+            value[3:6] = normal / length
+        value[6:8] = (
+            updated[keep, 6:8] * (1.0 - amount)
+            + updated[remove, 6:8] * amount
+        )
+        updated[keep] = value
+        remap[remove] = keep
+
+    rebuilt = remap[triangles]
+    distinct = (
+        (rebuilt[:, 0] != rebuilt[:, 1])
+        & (rebuilt[:, 1] != rebuilt[:, 2])
+        & (rebuilt[:, 2] != rebuilt[:, 0])
+    )
+    rebuilt = rebuilt[distinct]
+    rebuilt_flat = _drop_degenerate_triangles(rebuilt.reshape(-1), updated[:, :3])
+    rebuilt_flat = _triangle_rows_without_duplicates(rebuilt_flat)
+    rebuilt = rebuilt_flat.reshape(-1, 3)
+    if not rebuilt.size:
+        return np.empty((0, 8), dtype=np.float32), np.empty((0,), dtype=np.uint32)
+    used = np.unique(rebuilt)
+    compact = np.full((updated.shape[0],), -1, dtype=np.int64)
+    compact[used] = np.arange(used.size, dtype=np.int64)
+    return (
+        np.ascontiguousarray(updated[used], dtype=np.float32),
+        np.ascontiguousarray(compact[rebuilt].reshape(-1), dtype=np.uint32),
+    )
+
+
+def _decimate_geometry_python(
+    geometry: GeometryData,
+    percentage: float = 100.0,
+    *,
+    name: str = "Decimated Geometry",
+    context: GeometryEvalContext | None = None,
+) -> GeometryData:
+    """Reduce triangle count with constrained quadric edge collapses.
+
+    ``percentage`` is the target percentage of input triangles to retain. UV
+    seams and hard-normal splits are represented by disconnected indexed
+    vertices and therefore remain protected boundaries automatically.
+    """
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Decimate requires a connected Geometry input")
+    percentage = min(max(float(percentage), 1.0), 100.0)
+    if percentage >= 99.999 or geometry.triangle_count <= 1:
+        return geometry.copy(name=name)
+
+    cleaned = clean_weld_geometry(
+        geometry,
+        remove_degenerate=True,
+        remove_unused=True,
+        merge_vertices=False,
+        name=name,
+    )
+    original_triangles = cleaned.triangle_count
+    if original_triangles <= 1:
+        return cleaned
+    target = max(1, int(round(original_triangles * percentage / 100.0)))
+    vertices = cleaned.vertices.copy()
+    indices = cleaned.indices.copy()
+
+    # Rebuilding candidates in moderate independent batches keeps the pure
+    # NumPy/Python implementation deterministic without maintaining a fragile
+    # mutable half-edge heap. Each accepted collapse is topology checked.
+    for _pass in range(96):
+        if context is not None:
+            context.progress(_pass, 96, "Python fallback mesh simplification")
+        current = int(indices.size // 3)
+        if current <= target or vertices.shape[0] < 3:
+            break
+        (
+            triangles,
+            raw_normals,
+            face_lengths,
+            edges,
+            edge_counts,
+            amounts,
+            costs,
+        ) = _decimation_candidates(vertices, indices)
+        if not edges.size:
+            break
+        order = np.argsort(costs, kind="stable")
+        vertex_faces = _vertex_face_lists(triangles, vertices.shape[0])
+        boundary_edges = edges[edge_counts == 1]
+        boundary_vertex = np.zeros((vertices.shape[0],), dtype=bool)
+        if boundary_edges.size:
+            boundary_vertex[boundary_edges.reshape(-1)] = True
+        boundary_keys = {
+            (int(edge[0]), int(edge[1])) for edge in boundary_edges
+        }
+        neighbour_cache: dict[int, set[int]] = {}
+
+        def neighbours(vertex: int) -> set[int]:
+            cached = neighbour_cache.get(vertex)
+            if cached is not None:
+                return cached
+            values: set[int] = set()
+            for face_index in vertex_faces[vertex]:
+                values.update(int(item) for item in triangles[face_index])
+            values.discard(vertex)
+            neighbour_cache[vertex] = values
+            return values
+
+        selected = np.zeros((vertices.shape[0],), dtype=bool)
+        selections: list[tuple[int, int, float, np.ndarray]] = []
+        reduction_left = current - target
+        max_batch = min(4096, max(1, reduction_left))
+        positions = vertices[:, :3]
+        mesh_scale = max(float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0))), 1.0)
+        minimum_area_twice = mesh_scale * mesh_scale * 1.0e-12
+        for edge_index in order:
+            u = int(edges[edge_index, 0])
+            v = int(edges[edge_index, 1])
+            if selected[u] or selected[v]:
+                continue
+            removed_faces = int(edge_counts[edge_index])
+            if removed_faces > reduction_left:
+                continue
+            u_boundary = bool(boundary_vertex[u])
+            v_boundary = bool(boundary_vertex[v])
+            if u_boundary != v_boundary:
+                continue
+            if u_boundary and (u, v) not in boundary_keys:
+                continue
+            # The link condition prevents bow-ties and non-manifold collapses.
+            if len(neighbours(u).intersection(neighbours(v))) != removed_faces:
+                continue
+            amount = float(amounts[edge_index])
+            replacement = (
+                positions[u].astype(np.float64) * (1.0 - amount)
+                + positions[v].astype(np.float64) * amount
+            ).astype(np.float32)
+            if not _collapse_preserves_faces(
+                u,
+                v,
+                replacement,
+                triangles,
+                positions,
+                raw_normals,
+                face_lengths,
+                vertex_faces,
+                minimum_area_twice,
+            ):
+                continue
+            selections.append((u, v, amount, replacement))
+            selected[u] = True
+            selected[v] = True
+            reduction_left -= removed_faces
+            if reduction_left <= 0 or len(selections) >= max_batch:
+                break
+        if not selections:
+            break
+        candidate_vertices, candidate_indices = _apply_decimation_batch(
+            vertices, triangles, selections
+        )
+        if candidate_indices.size // 3 < target:
+            # Independent collapses can occasionally remove duplicate triangles
+            # in addition to their directly incident faces. Trim the batch so
+            # Percentage never jumps below the requested target.
+            low = 1
+            high = len(selections)
+            best: tuple[np.ndarray, np.ndarray] | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                trial = _apply_decimation_batch(vertices, triangles, selections[:middle])
+                if trial[1].size // 3 >= target:
+                    best = trial
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                break
+            candidate_vertices, candidate_indices = best
+        vertices, indices = candidate_vertices, candidate_indices
+        if indices.size < 3:
+            break
+
+    if indices.size < 3:
+        # A valid GeometryData can be empty, but a 1% decimation control is much
+        # more useful when it always leaves at least one visible triangle.
+        return cleaned.copy(name=name)
+    result = GeometryData(vertices, indices, name, geometry.uv_origin)
+    if context is not None:
+        context.progress(96, 96, "Python fallback mesh simplification complete")
+    return result
+
+
+def decimate_geometry(
+    geometry: GeometryData,
+    percentage: float = 100.0,
+    *,
+    name: str = "Decimated Geometry",
+    context: GeometryEvalContext | None = None,
+) -> GeometryData:
+    """Reduce a mesh with native QEM and crack-free attribute reconstruction.
+
+    Attribute seams are welded only for geometric topology, then UV and hard
+    normal splits are restored at identical output positions. This avoids the
+    visible gaps produced when each side of an imported UV seam is simplified
+    independently. A cancellable NumPy implementation remains as a compatibility
+    fallback when the native wheel is unavailable.
+    """
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Decimate requires a connected Geometry input")
+    percentage = min(max(float(percentage), 1.0), 100.0)
+    if percentage >= 99.999 or geometry.triangle_count <= 1:
+        result = geometry.copy(name=name)
+        if context is not None:
+            context.report_metadata({
+                "_output_vertex_count": result.vertex_count,
+                "_output_triangle_count": result.triangle_count,
+                "_decimation_backend": "Pass-through",
+            })
+        return result
+
+    target = max(1, int(round(geometry.triangle_count * percentage / 100.0)))
+    native_warning = ""
+    try:
+        from .mesh_processing import (
+            NativeSimplificationCancelled,
+            NativeSimplificationUnavailable,
+            native_decimate,
+        )
+
+        vertices, indices, diagnostics, backend, pass_count = native_decimate(
+            geometry.vertices,
+            geometry.indices,
+            target,
+            aggression=3.0,
+            cancel_check=context.cancel_check if context is not None else None,
+            progress_callback=(
+                (lambda current, total, message: context.progress(current, total, message))
+                if context is not None
+                else None
+            ),
+        )
+        result = GeometryData(vertices, indices, name, geometry.uv_origin)
+        if context is not None:
+            context.report_metadata({
+                **diagnostics.as_metadata(prefix="_output_"),
+                "_decimation_backend": backend,
+                "_decimation_warning": "",
+                "_decimation_target_triangles": target,
+                "_decimation_pass_count": pass_count,
+                "_decimation_target_reached": result.triangle_count <= target,
+            })
+        return result
+    except GeometryEvaluationCancelled:
+        raise
+    except Exception as exc:
+        # A missing native wheel is expected only when an existing tester venv
+        # has not rerun setup. Topology rejection and third-party library errors
+        # also fall back safely instead of losing the user's graph preview.
+        if exc.__class__.__name__ == "NativeSimplificationCancelled":
+            raise GeometryEvaluationCancelled(str(exc)) from exc
+        native_warning = str(exc)
+
+    result = _decimate_geometry_python(
+        geometry,
+        percentage,
+        name=name,
+        context=context,
+    )
+    if context is not None:
+        from .mesh_processing import diagnose_mesh
+
+        diagnostics = diagnose_mesh(
+            result.vertices,
+            result.indices,
+            cancel_check=context.cancel_check,
+        )
+        context.report_metadata({
+            **diagnostics.as_metadata(prefix="_output_"),
+            "_decimation_backend": "Python compatibility fallback",
+            "_decimation_warning": native_warning,
+            "_decimation_target_triangles": target,
+        })
+    return result
+
+
+def _midpoint_matches(
+    midpoint: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    position_tolerance: float,
+    uv_tolerance: float,
+) -> bool:
+    expected_position = (a[:3] + b[:3]) * 0.5
+    if float(np.linalg.norm(midpoint[:3] - expected_position)) > position_tolerance:
+        return False
+    expected_uv = (a[6:8] + b[6:8]) * 0.5
+    if float(np.linalg.norm(midpoint[6:8] - expected_uv)) > uv_tolerance:
+        return False
+    return True
+
+
+def _unsubdivide_once(geometry: GeometryData, *, name: str) -> GeometryData | None:
+    triangles = geometry.indices.reshape(-1, 3)
+    if triangles.shape[0] < 4 or triangles.shape[0] % 4:
+        return None
+
+    # Geometry Subdivide writes a stable four-triangle patch for every source
+    # triangle. Recognising that signature makes the inverse exact even after
+    # smooth relaxation or later position deformations, because those operations
+    # do not destroy the authored topology order.
+    ordered_originals: list[tuple[int, int, int]] = []
+    ordered_match = True
+    for start in range(0, triangles.shape[0], 4):
+        first, second, third, centre = triangles[start : start + 4]
+        a, ab, ca = (int(first[0]), int(first[1]), int(first[2]))
+        if int(second[0]) != ab:
+            ordered_match = False
+            break
+        b, bc = int(second[1]), int(second[2])
+        if tuple(int(value) for value in third[:2]) != (ca, bc):
+            ordered_match = False
+            break
+        c = int(third[2])
+        if tuple(int(value) for value in centre) != (ab, bc, ca):
+            ordered_match = False
+            break
+        if len({a, b, c, ab, bc, ca}) != 6:
+            ordered_match = False
+            break
+        ordered_originals.append((a, b, c))
+    if ordered_match and ordered_originals:
+        rebuilt = np.asarray(ordered_originals, dtype=np.uint32)
+        used = np.unique(rebuilt)
+        remap = np.full((geometry.vertex_count,), -1, dtype=np.int64)
+        remap[used] = np.arange(used.size, dtype=np.int64)
+        return GeometryData(
+            np.ascontiguousarray(geometry.vertices[used], dtype=np.float32),
+            np.ascontiguousarray(remap[rebuilt].reshape(-1), dtype=np.uint32),
+            name,
+            geometry.uv_origin,
+        )
+    edge_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for face_index, triangle in enumerate(triangles):
+        a, b, c = (int(triangle[0]), int(triangle[1]), int(triangle[2]))
+        for u, v, opposite in ((a, b, c), (b, c, a), (c, a, b)):
+            key = (min(u, v), max(u, v))
+            edge_map.setdefault(key, []).append((face_index, opposite))
+
+    positions = geometry.vertices[:, :3]
+    extent = positions.max(axis=0) - positions.min(axis=0) if positions.size else np.ones(3)
+    position_tolerance = max(float(np.linalg.norm(extent)) * 2.0e-5, 1.0e-7)
+    uv_tolerance = 2.0e-5
+    patches: list[tuple[set[int], tuple[int, int, int]]] = []
+    vertices = geometry.vertices
+
+    for centre_index, triangle in enumerate(triangles):
+        x, y, z = (int(triangle[0]), int(triangle[1]), int(triangle[2]))
+        opposite_vertices: list[int] = []
+        corner_faces: list[int] = []
+        valid = True
+        for u, v in ((x, y), (y, z), (z, x)):
+            adjacent = edge_map.get((min(u, v), max(u, v)), ())
+            if len(adjacent) != 2:
+                valid = False
+                break
+            other = adjacent[0] if adjacent[1][0] == centre_index else adjacent[1]
+            if other[0] == centre_index:
+                valid = False
+                break
+            corner_faces.append(int(other[0]))
+            opposite_vertices.append(int(other[1]))
+        if not valid:
+            continue
+        # Across central edges x-y, y-z and z-x sit original vertices b, c and a.
+        b, c, a = opposite_vertices
+        if len({a, b, c, x, y, z}) != 6:
+            continue
+        if len(set(corner_faces)) != 3:
+            continue
+        if not _midpoint_matches(
+            vertices[x], vertices[a], vertices[b],
+            position_tolerance=position_tolerance, uv_tolerance=uv_tolerance,
+        ):
+            continue
+        if not _midpoint_matches(
+            vertices[y], vertices[b], vertices[c],
+            position_tolerance=position_tolerance, uv_tolerance=uv_tolerance,
+        ):
+            continue
+        if not _midpoint_matches(
+            vertices[z], vertices[c], vertices[a],
+            position_tolerance=position_tolerance, uv_tolerance=uv_tolerance,
+        ):
+            continue
+        patches.append(({centre_index, *corner_faces}, (a, b, c)))
+
+    if not patches:
+        return None
+    face_owners = np.zeros((triangles.shape[0],), dtype=np.int32)
+    for faces, _original in patches:
+        for face_index in faces:
+            face_owners[face_index] += 1
+    selected_patches = [
+        patch for patch in patches if all(face_owners[index] == 1 for index in patch[0])
+    ]
+    covered: set[int] = set()
+    originals: list[tuple[int, int, int]] = []
+    for faces, original in selected_patches:
+        if covered.intersection(faces):
+            continue
+        covered.update(faces)
+        originals.append(original)
+    if len(covered) != triangles.shape[0] or len(originals) * 4 != triangles.shape[0]:
+        return None
+
+    rebuilt = np.asarray(originals, dtype=np.uint32)
+    used = np.unique(rebuilt)
+    remap = np.full((geometry.vertex_count,), -1, dtype=np.int64)
+    remap[used] = np.arange(used.size, dtype=np.int64)
+    return GeometryData(
+        np.ascontiguousarray(vertices[used], dtype=np.float32),
+        np.ascontiguousarray(remap[rebuilt].reshape(-1), dtype=np.uint32),
+        name,
+        geometry.uv_origin,
+    )
+
+
+
+def _cluster_grid_axis(values: np.ndarray, tolerance: float) -> tuple[np.ndarray, np.ndarray]:
+    """Cluster nearly equal UV coordinates and return centres plus per-value bins."""
+
+    order = np.argsort(values, kind="stable")
+    bins = np.empty(values.shape[0], dtype=np.int32)
+    centres: list[float] = []
+    members: list[int] = []
+    current: list[float] = []
+    for raw_index in order:
+        index = int(raw_index)
+        value = float(values[index])
+        if current and abs(value - float(np.mean(current))) > tolerance:
+            centre_index = len(centres)
+            centres.append(float(np.mean(current)))
+            bins[np.asarray(members, dtype=np.int64)] = centre_index
+            current = []
+            members = []
+        current.append(value)
+        members.append(index)
+    if current:
+        centre_index = len(centres)
+        centres.append(float(np.mean(current)))
+        bins[np.asarray(members, dtype=np.int64)] = centre_index
+    return np.asarray(centres, dtype=np.float64), bins
+
+
+def _triangle_components(triangles: np.ndarray, vertex_count: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return topology islands as (vertex ids, face ids)."""
+
+    parent = np.arange(vertex_count, dtype=np.int64)
+    rank = np.zeros(vertex_count, dtype=np.int8)
+
+    def find(value: int) -> int:
+        root = value
+        while int(parent[root]) != root:
+            root = int(parent[root])
+        while int(parent[value]) != value:
+            following = int(parent[value])
+            parent[value] = root
+            value = following
+        return root
+
+    def union(first: int, second: int) -> None:
+        a = find(first)
+        b = find(second)
+        if a == b:
+            return
+        if rank[a] < rank[b]:
+            a, b = b, a
+        parent[b] = a
+        if rank[a] == rank[b]:
+            rank[a] += 1
+
+    for triangle in triangles:
+        a, b, c = (int(triangle[0]), int(triangle[1]), int(triangle[2]))
+        union(a, b)
+        union(a, c)
+
+    face_groups: dict[int, list[int]] = {}
+    vertex_groups: dict[int, set[int]] = {}
+    for face_index, triangle in enumerate(triangles):
+        root = find(int(triangle[0]))
+        face_groups.setdefault(root, []).append(face_index)
+        vertex_groups.setdefault(root, set()).update(int(value) for value in triangle)
+    return [
+        (
+            np.asarray(sorted(vertex_groups[root]), dtype=np.int64),
+            np.asarray(face_groups[root], dtype=np.int64),
+        )
+        for root in face_groups
+    ]
+
+
+def _structured_uv_unsubdivide_once(
+    geometry: GeometryData,
+    *,
+    name: str,
+) -> GeometryData | None:
+    """Reduce regular triangulated UV grids by keeping alternate rows/columns.
+
+    Plane, Box and Ribbon generators create regular UV lattices rather than the
+    four-triangle midpoint pattern emitted by Geometry Subdivide.  A true
+    topological un-subdivide can still be performed on those lattices, including
+    after position-only deformation, by using UVs to recover rows and columns.
+    """
+
+    triangles = geometry.indices.reshape(-1, 3)
+    if not triangles.size:
+        return None
+    vertices = geometry.vertices
+    components = _triangle_components(triangles, geometry.vertex_count)
+    output_vertices: list[np.ndarray] = []
+    output_indices: list[np.ndarray] = []
+    reduced_any = False
+
+    for vertex_ids, face_ids in components:
+        local_uvs = vertices[vertex_ids, 6:8].astype(np.float64, copy=False)
+        span = np.ptp(local_uvs, axis=0)
+        tolerance_u = max(float(span[0]) * 1.0e-5, 1.0e-6)
+        tolerance_v = max(float(span[1]) * 1.0e-5, 1.0e-6)
+        u_values, u_bins = _cluster_grid_axis(local_uvs[:, 0], tolerance_u)
+        v_values, v_bins = _cluster_grid_axis(local_uvs[:, 1], tolerance_v)
+        columns = int(u_values.size)
+        rows = int(v_values.size)
+        if columns < 2 or rows < 2 or columns * rows != vertex_ids.size:
+            return None
+
+        grid = np.full((rows, columns), -1, dtype=np.int64)
+        for local_index, global_index in enumerate(vertex_ids):
+            row = int(v_bins[local_index])
+            column = int(u_bins[local_index])
+            if grid[row, column] >= 0:
+                return None
+            grid[row, column] = int(global_index)
+        if np.any(grid < 0):
+            return None
+
+        # Confirm that every source triangle is local to one UV-grid cell. This
+        # prevents arbitrary meshes with coincident UV coordinates from being
+        # mistaken for a structured generator lattice.
+        inverse = {int(global_index): local_index for local_index, global_index in enumerate(vertex_ids)}
+        for face_index in face_ids:
+            triangle = triangles[int(face_index)]
+            local = np.asarray([inverse[int(value)] for value in triangle], dtype=np.int64)
+            face_u = u_bins[local]
+            face_v = v_bins[local]
+            if int(face_u.max() - face_u.min()) > 1 or int(face_v.max() - face_v.min()) > 1:
+                return None
+
+        selected_u = list(range(0, columns, 2))
+        selected_v = list(range(0, rows, 2))
+        if selected_u[-1] != columns - 1:
+            selected_u.append(columns - 1)
+        if selected_v[-1] != rows - 1:
+            selected_v.append(rows - 1)
+        if len(selected_u) == columns and len(selected_v) == rows:
+            return None
+        reduced_any = True
+
+        component_triangles: list[int] = []
+        for row_index in range(len(selected_v) - 1):
+            top = selected_v[row_index]
+            bottom = selected_v[row_index + 1]
+            for column_index in range(len(selected_u) - 1):
+                left = selected_u[column_index]
+                right = selected_u[column_index + 1]
+                a = int(grid[top, left])
+                b = int(grid[top, right])
+                c = int(grid[bottom, left])
+                d = int(grid[bottom, right])
+                pa, pb, pc = vertices[[a, b, c], :3]
+                normal = np.cross(pb - pa, pc - pa)
+                authored = vertices[[a, b, c, d], 3:6].sum(axis=0)
+                if float(np.dot(normal, authored)) >= 0.0:
+                    component_triangles.extend((a, b, c, b, d, c))
+                else:
+                    component_triangles.extend((a, c, b, b, c, d))
+
+        component_indices = np.asarray(component_triangles, dtype=np.uint32)
+        component_indices = _drop_degenerate_triangles(component_indices, vertices[:, :3])
+        if component_indices.size < 3:
+            return None
+        used = np.unique(component_indices)
+        remap = np.full((geometry.vertex_count,), -1, dtype=np.int64)
+        remap[used] = np.arange(used.size, dtype=np.int64)
+        base = sum(chunk.shape[0] for chunk in output_vertices)
+        output_vertices.append(np.ascontiguousarray(vertices[used], dtype=np.float32))
+        output_indices.append(
+            np.ascontiguousarray(remap[component_indices].astype(np.uint32) + base, dtype=np.uint32)
+        )
+
+    if not reduced_any or not output_indices:
+        return None
+    return GeometryData(
+        np.ascontiguousarray(np.concatenate(output_vertices, axis=0), dtype=np.float32),
+        np.ascontiguousarray(np.concatenate(output_indices), dtype=np.uint32),
+        name,
+        geometry.uv_origin,
+    )
+
+def unsubdivide_geometry(
+    geometry: GeometryData,
+    iterations: int = 1,
+    *,
+    name: str = "Un-Subdivided Geometry",
+) -> GeometryData:
+    """Reverse compatible subdivision or structured UV-grid topology.
+
+    Geometry Subdivide lineage is restored exactly. Regular UV lattices from
+    Plane, Box and Ribbon generators can also be reduced by alternate rows and
+    columns. Arbitrary imported scans do not retain an earlier control mesh and
+    should be simplified with Geometry Decimate instead.
+    """
+
+    if not isinstance(geometry, GeometryData):
+        raise TypeError("Geometry Un-Subdivide requires a connected Geometry input")
+    iterations = min(max(int(iterations), 1), 6)
+    result = geometry.copy(name=name)
+    completed = 0
+    mode: str | None = None
+    for _iteration in range(iterations):
+        rebuilt = None
+        if mode != "grid":
+            rebuilt = _unsubdivide_once(result, name=name)
+            if rebuilt is not None:
+                mode = "midpoint"
+            elif mode == "midpoint":
+                # Once a Geometry Subdivide lineage has been reversed, stop at
+                # its original authored mesh rather than unexpectedly applying
+                # a second grid-reduction algorithm to that source mesh.
+                break
+        if rebuilt is None and mode in {None, "grid"}:
+            rebuilt = _structured_uv_unsubdivide_once(result, name=name)
+            if rebuilt is not None:
+                mode = "grid"
+        if rebuilt is None:
+            break
+        result = rebuilt
+        completed += 1
+    if completed == 0:
+        raise ValueError(
+            "Geometry Un-Subdivide could not find compatible midpoint subdivision topology or regular UV-grid topology. "
+            "It works after Geometry Subdivide and on structured Plane, Box and Ribbon grids. "
+            "Arbitrary imported or scanned meshes do not retain an earlier control mesh; use Geometry Decimate for those."
+        )
+    result.name = name
+    return result
 
 def normals_geometry(
     geometry: GeometryData,
@@ -1507,10 +2843,12 @@ def normals_geometry(
 
     if flip_normals:
         vertices[:, 3:6] *= -1.0
-    return GeometryData(vertices, indices, name)
+    return GeometryData(vertices, indices, name, geometry.uv_origin)
 
 
-def _sample_height_bilinear(heightmap: np.ndarray, uvs: np.ndarray) -> np.ndarray:
+def _sample_height_bilinear(
+    heightmap: np.ndarray, uvs: np.ndarray, uv_origin: str = UV_ORIGIN_TOP_LEFT
+) -> np.ndarray:
     image = np.asarray(heightmap, dtype=np.float32)
     if image.ndim == 3:
         if image.shape[2] < 1:
@@ -1524,7 +2862,10 @@ def _sample_height_bilinear(heightmap: np.ndarray, uvs: np.ndarray) -> np.ndarra
     # integer tiling. Repeat sampling keeps those seams exact.
     wrapped = uv - np.floor(uv)
     x = wrapped[:, 0] * width - 0.5
-    y = wrapped[:, 1] * height - 0.5
+    sample_v = wrapped[:, 1]
+    if normalise_uv_origin(uv_origin) == UV_ORIGIN_BOTTOM_LEFT:
+        sample_v = 1.0 - sample_v
+    y = sample_v * height - 0.5
     x0 = np.floor(x).astype(np.int64)
     y0 = np.floor(y).astype(np.int64)
     tx = (x - x0).astype(np.float32)
@@ -1557,13 +2898,13 @@ def displace_geometry(
     normals = vertices[:, 3:6]
     lengths = np.linalg.norm(normals, axis=1, keepdims=True)
     unit_normals = normals / np.maximum(lengths, 1.0e-8)
-    sampled = _sample_height_bilinear(heightmap, vertices[:, 6:8])
+    sampled = _sample_height_bilinear(heightmap, vertices[:, 6:8], geometry.uv_origin)
     vertices[:, :3] += unit_normals * (sampled[:, None] * float(amount))
     # Displacement intentionally preserves authored normals. Terrain and VFX
     # meshes commonly receive final shading from a normal map; explicit mesh
     # normal rebuilding belongs to the Geometry Normals node.
     vertices[:, 3:6] = normals
-    return GeometryData(vertices, geometry.indices.copy(), name)
+    return GeometryData(vertices, geometry.indices.copy(), name, geometry.uv_origin)
 
 
 
@@ -1727,6 +3068,35 @@ def evaluate_subdivide_geometry(
     )
 
 
+
+def evaluate_decimate_geometry(
+    inputs: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    context: GeometryEvalContext | None = None,
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return decimate_geometry(
+        geometry,
+        percentage=float(parameters.get("percentage", 100.0)),
+        name=str(parameters.get("name", "Decimated Geometry") or "Decimated Geometry"),
+        context=context,
+    )
+
+
+def evaluate_unsubdivide_geometry(
+    inputs: Mapping[str, Any], parameters: Mapping[str, Any]
+) -> GeometryData:
+    geometry = inputs.get("Geometry")
+    if not isinstance(geometry, GeometryData):
+        raise ValueError("Geometry is not connected")
+    return unsubdivide_geometry(
+        geometry,
+        iterations=int(parameters.get("iterations", 1)),
+        name=str(parameters.get("name", "Un-Subdivided Geometry") or "Un-Subdivided Geometry"),
+    )
+
 def evaluate_normals_geometry(
     inputs: Mapping[str, Any], parameters: Mapping[str, Any]
 ) -> GeometryData:
@@ -1869,7 +3239,10 @@ def export_obj(
     for position in vertices[:, :3]:
         lines.append(f"v {position[0]:.9g} {position[1]:.9g} {position[2]:.9g}")
     if include_uvs:
-        for uv in vertices[:, 6:8]:
+        standard_vertices = convert_uv_origin(
+            vertices, geometry.uv_origin, UV_ORIGIN_BOTTOM_LEFT
+        )
+        for uv in standard_vertices[:, 6:8]:
             v = 1.0 - float(uv[1]) if flip_v else float(uv[1])
             lines.append(f"vt {float(uv[0]):.9g} {v:.9g}")
     if include_normals:

@@ -436,14 +436,24 @@ def derive_seed(instance_seed: int, original_seed: int, identity: str) -> int:
 def asset_graph_data(parameters: Mapping[str, Any]) -> dict[str, Any]:
     mode = str(parameters.get("_asset_mode", "Linked"))
     if mode == "Embedded" and isinstance(parameters.get("_asset_embedded_graph"), Mapping):
-        return deepcopy(dict(parameters["_asset_embedded_graph"]))
-    cached = parameters.get("_asset_cached_graph")
-    if isinstance(cached, Mapping):
-        return deepcopy(dict(cached))
-    path = str(parameters.get("_asset_path", ""))
-    if path:
-        return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    raise ValueError("The Graph Instance has no linked or embedded source graph.")
+        data = deepcopy(dict(parameters["_asset_embedded_graph"]))
+    else:
+        cached = parameters.get("_asset_cached_graph")
+        if isinstance(cached, Mapping):
+            data = deepcopy(dict(cached))
+        else:
+            path = str(parameters.get("_asset_path", ""))
+            if not path:
+                raise ValueError("The Graph Instance has no linked or embedded source graph.")
+            data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+
+    # Format 19 stores imported image/mesh payloads once in the child graph's
+    # resource library. Nested evaluation still consumes the established node
+    # parameters, so hydrate a private copy before expanding the instance.
+    from .graph_resources import migrate_project_resources
+
+    migrate_project_resources(data)
+    return data
 
 
 def graph_asset_dependency_paths(data: Mapping[str, Any]) -> list[str]:

@@ -7,7 +7,7 @@ An internet connection is required during the first setup.
 
 WINDOWS
 -------
-1. Install a current 64-bit Python 3 release (Python 3.11 or newer).
+1. Install 64-bit Python 3.11, 3.12 or 3.13. Python 3.14 is not used for source setup because xatlas does not currently publish a Windows 3.14 wheel.
    During installation, enable "Add python.exe to PATH" and install the
    Python launcher when those options are shown.
 2. Extract the entire VFX Texture Lab ZIP to an ordinary folder.
@@ -20,7 +20,7 @@ Python packages. It does not change the Python packages used by other apps.
 
 LINUX
 -----
-1. Install Python 3.11 or newer, pip, and virtual-environment support.
+1. Install Python 3.11 or newer, pip, and virtual-environment support. If the system Python is 3.14+, setup.sh automatically downloads a private Python 3.13 runtime; it does not replace or modify the system Python.
 2. Extract the entire archive and open a terminal in its folder.
 3. Run:
 
@@ -36,12 +36,24 @@ LINUX
 
 UPDATES
 -------
-For another source-testing version, extract it to a new folder and run the
-matching setup script again. Do not copy a .venv folder between computers,
-between Linux and Windows, or between substantially different Python versions.
+For another source-testing version, either extract it to a new folder or copy
+it over the existing project folder, then run the matching setup script again.
+Version 0.52.1 adds the Geometry Remesh dependency stack. Run setup.sh or
+setup.bat once after updating, even if the 0.52.0 Automatic Charts environment
+is already installed. Projection unwrap modes can run without xatlas, but
+Automatic Charts requires it; Geometry Remesh requires trimesh, SciPy and
+scikit-image.
+Do not copy a .venv folder between computers, between Linux and Windows, or
+between substantially different Python versions.
 
 TROUBLESHOOTING
 ---------------
 Keep graphics drivers reasonably current. The GPU renderer uses WebGPU through
 wgpu-py. If setup or startup fails, copy or screenshot the complete terminal or
 Command Prompt output and send it with the report.
+
+
+Version 0.53.0 adds the Geometry Bake High to Low dependency. Run setup.sh or
+setup.bat once after replacing an older source folder so the binary embreex/Embree
+runtime is installed. End users of the packaged Windows builds do not need to
+install it separately.

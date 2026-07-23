@@ -103,7 +103,7 @@ def main() -> None:
 
     # Reroute type and bypass state survive graph serialization.
     payload = scene.to_dict()
-    assert payload["version"] == 18
+    assert payload["version"] == 20
     restored = GraphScene(registry)
     restored.from_dict(payload)
     restored_reroutes = [item for item in restored.nodes.values() if isinstance(item, RerouteItem)]

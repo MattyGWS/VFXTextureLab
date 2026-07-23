@@ -1,3 +1,3 @@
 """VFX Texture Lab package."""
 
-__version__ = "0.50.1"
+__version__ = "0.53.0.3"

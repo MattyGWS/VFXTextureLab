@@ -843,6 +843,7 @@ class PreviewPanel(QWidget):
     gizmoParametersChanged = Signal(str, object)
     gizmoEditFinished = Signal(str)
     editInputToggled = Signal(bool)
+    uvOptionsChanged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -897,6 +898,22 @@ class PreviewPanel(QWidget):
         )
         self.edit_input_button.setVisible(False)
         self.edit_input_button.toggled.connect(self._edit_input_toggled)
+        self.uv_buttons: dict[str, QToolButton] = {}
+        for key, label, tooltip, checked in (
+            ("wireframe", "Wires", "Show UV triangle wireframe", True),
+            ("islands", "Islands", "Tint UV islands with distinct translucent fills", True),
+            ("seams", "Seams", "Highlight UV island boundaries", True),
+            ("overlaps", "Overlaps", "Highlight overlapping UV triangles in red", True),
+            ("checker", "Checker", "Show a checkerboard when no Preview Texture is connected", True),
+        ):
+            button = QToolButton()
+            button.setText(label)
+            button.setCheckable(True)
+            button.setChecked(checked)
+            button.setToolTip(tooltip)
+            button.setVisible(False)
+            button.toggled.connect(lambda _checked=False: self.uvOptionsChanged.emit())
+            self.uv_buttons[key] = button
         self.zoom_label = QLabel("100%")
         self.zoom_label.setObjectName("muted")
         self.canvas.zoomChanged.connect(self._zoom_changed)
@@ -904,6 +921,8 @@ class PreviewPanel(QWidget):
         view_controls.addWidget(self.fit_button)
         view_controls.addWidget(self.one_to_one_button)
         view_controls.addWidget(self.edit_input_button)
+        for button in self.uv_buttons.values():
+            view_controls.addWidget(button)
         view_controls.addWidget(self.zoom_label)
         view_controls.addStretch(1)
         view_hint = QLabel("Wheel: zoom · middle-drag: pan")
@@ -940,6 +959,17 @@ class PreviewPanel(QWidget):
         self.canvas.gizmoEditStarted.connect(self.gizmoEditStarted.emit)
         self.canvas.gizmoParametersChanged.connect(self.gizmoParametersChanged.emit)
         self.canvas.gizmoEditFinished.connect(self.gizmoEditFinished.emit)
+
+    def set_uv_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        for button in self.uv_buttons.values():
+            button.setVisible(enabled)
+        self.tile_button.setVisible(not enabled)
+        for button in self.channel_buttons.values():
+            button.setVisible(not enabled)
+
+    def uv_preview_options(self) -> dict[str, bool]:
+        return {key: bool(button.isChecked()) for key, button in self.uv_buttons.items()}
 
     @property
     def edit_input_enabled(self) -> bool:
@@ -1062,13 +1092,14 @@ class PreviewPanel(QWidget):
             if display_rgba is not None else None
         )
         self._data_kind = data_kind
+        self.set_uv_mode(data_kind == "uv")
         self._output_precision = output_precision or precision
         self.title.setText(node_name or "No active node")
         if error:
             self._frame_base_info = ""
             self._set_info_text(f"Evaluation failed: {error}")
         elif image is not None or self._prepared_rgba is not None:
-            kind_label = {"grayscale": "Greyscale", "color": "Colour", "vector": "Vector / Normal"}.get(self._data_kind, self._data_kind.title())
+            kind_label = {"grayscale": "Greyscale", "color": "Colour", "vector": "Vector / Normal", "uv": "UV Layout"}.get(self._data_kind, self._data_kind.title())
             details = details_override or f"{width} × {height} preview · {kind_label} · {self._output_precision}"
             if signal_value is not None:
                 if isinstance(signal_value, tuple):

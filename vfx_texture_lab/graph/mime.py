@@ -4,3 +4,4 @@ GRAPH_ASSET_MIME_TYPE = "application/x-vfx-texture-lab-graph-asset"
 SELECTION_MIME_TYPE = "application/x-vfx-texture-lab-node-selection"
 
 OPEN_GRAPH_MIME_TYPE = "application/x-vfx-texture-lab-open-graph"
+GRAPH_RESOURCE_MIME_TYPE = "application/x-vfx-texture-lab-graph-resource"

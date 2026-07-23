@@ -45,7 +45,8 @@ from ..histogram import (
     stratified_image_sample,
 )
 from ..engine import AsyncEvaluationController, GraphSnapshot
-from ..nodes.base import ParameterSpec, is_image_kind
+from ..nodes.base import ParameterSpec, is_image_kind, normalise_port_kind
+from ..geometry_limits import AUTO_WIREFRAME_TRIANGLE_LIMIT
 from .spinboxes import CompactDoubleSpinBox, CompactSpinBox
 from .visual_editor_foundation import PALETTE, VisualEditorCanvas
 
@@ -1449,7 +1450,7 @@ class FileControl(QWidget):
         layout.setSpacing(5)
         self.edit = QLineEdit(str(value), self)
         self.file_kind = file_kind
-        self.edit.setPlaceholderText("Choose a glTF / GLB mesh…" if file_kind == "mesh" else "Choose an image file…")
+        self.edit.setPlaceholderText("Choose a Wavefront OBJ mesh…" if file_kind == "mesh" else "Choose an image file…")
         self.edit.editingFinished.connect(lambda: changed(self.edit.text().strip()))
         browse = QPushButton("Browse…", self)
         browse.clicked.connect(self._browse)
@@ -1462,8 +1463,8 @@ class FileControl(QWidget):
 
     def _browse(self) -> None:
         if self.file_kind == "mesh":
-            title = "Choose preview mesh"
-            filters = "glTF 2.0 meshes (*.gltf *.glb);;All files (*)"
+            title = "Choose OBJ mesh"
+            filters = "Wavefront OBJ meshes (*.obj);;All files (*)"
         else:
             title = "Choose image"
             filters = "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)"
@@ -2426,7 +2427,7 @@ class GraphPropertiesWidget(QWidget):
         created = QLabel(metadata.created_with or "Unknown", identity.body)
         created.setObjectName("muted")
         identity.addRow("Created with", created)
-        format_version = QLabel("VFX graph format 18", identity.body)
+        format_version = QLabel("VFX graph format 20", identity.body)
         format_version.setObjectName("muted")
         identity.addRow("Format", format_version)
         source = QLabel(source_path or "Not saved", identity.body)
@@ -2471,14 +2472,21 @@ class GraphPropertiesWidget(QWidget):
         cached_graphs = int(self.portability.get("cached_graphs", 0))
         external_images = int(self.portability.get("external_images", 0))
         embedded_images = int(self.portability.get("embedded_images", 0))
+        external_meshes = int(self.portability.get("external_meshes", 0))
+        embedded_meshes = int(self.portability.get("embedded_meshes", 0))
         graph_count = linked_graphs + embedded_graphs
         image_count = external_images + embedded_images
+        mesh_count = external_meshes + embedded_meshes
         portability_group.addRow("Nested graphs", QLabel(
             f"{graph_count} · {linked_graphs} linked · {embedded_graphs} embedded",
             portability_group.body,
         ))
         portability_group.addRow("Images", QLabel(
             f"{image_count} · {external_images} external · {embedded_images} embedded",
+            portability_group.body,
+        ))
+        portability_group.addRow("Meshes", QLabel(
+            f"{mesh_count} · {external_meshes} external · {embedded_meshes} embedded",
             portability_group.body,
         ))
         cache_label = QLabel(
@@ -2488,7 +2496,7 @@ class GraphPropertiesWidget(QWidget):
         cache_label.setObjectName("muted")
         portability_group.addRow("Recovery cache", cache_label)
         explanation = QLabel(
-            "A self-contained export embeds every reachable Graph Instance and Image Input into one portable .vfxgraph. "
+            "A self-contained export embeds every reachable Graph Instance, Image Input and Mesh Input into one portable .vfxgraph. "
             "It uses current open child revisions and can recover missing linked graphs from their last-known-good cache.",
             portability_group.body,
         )
@@ -2597,6 +2605,8 @@ class ParametersPanel(QWidget):
     interactiveEditStarted = Signal(str)
     interactiveEditFinished = Signal(str)
     histogramActivityChanged = Signal(bool, str)
+    manualActionRequested = Signal(str)
+    manualActionCancelRequested = Signal(str)
 
     CURVE_NODES = {
         "filter.curve": "tone",
@@ -2647,6 +2657,13 @@ class ParametersPanel(QWidget):
         self._levels_histogram_cache: dict[tuple, tuple[np.ndarray, float, float, int, int]] = {}
         self._adjustment_histogram_cache: dict[tuple, tuple[np.ndarray, int, int]] = {}
         self._parameter_group_states: dict[tuple[str, str], bool] = {}
+        self._interactive_parameter_depth = 0
+        self._deferred_same_item_refresh = False
+        self._manual_status_label: QLabel | None = None
+        self._manual_detail_label: QLabel | None = None
+        self._manual_error_caption: QLabel | None = None
+        self._manual_error_label: QLabel | None = None
+        self._manual_action_button: QPushButton | None = None
 
         self._levels_histogram_timer = QTimer(self)
         self._levels_histogram_timer.setSingleShot(True)
@@ -2841,6 +2858,25 @@ class ParametersPanel(QWidget):
         return self._context_kind == "graph" and self._graph_context_uid == str(session_uid)
 
     def set_item(self, item: NodeItem | GroupFrameItem | None) -> None:
+        previous = self.item
+        same_item = (
+            item is not None
+            and previous is not None
+            and type(item) is type(previous)
+            and str(getattr(item, "uid", "")) == str(getattr(previous, "uid", ""))
+        )
+        if same_item and self._interactive_parameter_depth > 0:
+            # Do not destroy the live slider/dial widget while the artist is
+            # dragging it. Several background/status paths can request an
+            # Inspector refresh while a manual node becomes Out of Date; the
+            # refresh is safely performed once the interaction ends.
+            self.item = item
+            self._deferred_same_item_refresh = True
+            return
+        if not same_item:
+            self._interactive_parameter_depth = 0
+            self._deferred_same_item_refresh = False
+        preserved_scroll = self.scroll.verticalScrollBar().value() if same_item else 0
         self._release_external_widget()
         self._finish_visual_edits()
         self.item = item
@@ -2853,6 +2889,11 @@ class ParametersPanel(QWidget):
         self._levels_histogram_completed_key = None
         self._adjustment_histogram_request_key = None
         self._adjustment_histogram_completed_key = None
+        self._manual_status_label = None
+        self._manual_detail_label = None
+        self._manual_error_caption = None
+        self._manual_error_label = None
+        self._manual_action_button = None
         if self._levels_histogram_controller is not None:
             self._levels_histogram_controller.cancel()
         if self._adjustment_histogram_controller is not None:
@@ -2900,7 +2941,13 @@ class ParametersPanel(QWidget):
         else:
             detached = self.scroll.takeWidget()
             self.scroll.setWidget(new_host)
-            self.scroll.verticalScrollBar().setValue(0)
+            self.scroll.verticalScrollBar().setValue(preserved_scroll)
+            QTimer.singleShot(
+                0,
+                lambda value=preserved_scroll: self.scroll.verticalScrollBar().setValue(
+                    min(int(value), self.scroll.verticalScrollBar().maximum())
+                ),
+            )
             new_host.show()
             if detached is not None and detached is not new_host:
                 detached.hide()
@@ -3055,9 +3102,147 @@ class ParametersPanel(QWidget):
         else:
             target.addRow(spec.label, control)
 
+    def _refresh_manual_execution_summary(self, node: NodeItem) -> None:
+        """Refresh the lightweight manual-action status without rebuilding controls.
+
+        Manual parameters are deliberately cheap to edit until the artist presses
+        the action button. Reconstructing the entire Inspector for each slider
+        value used to destroy the widget under the pointer and jump the scroll
+        area back to the top. Keep the live controls intact and update only the
+        small status summary here.
+        """
+        if node is None or not node.definition.manual_action_label:
+            return
+        status = str(node.parameters.get("_manual_status", "Not Run") or "Not Run")
+        running = status in {"Running", "Cancelling"} or (
+            bool(getattr(node, "_eval_active", False)) and status == "Running"
+        )
+        if running and status != "Cancelling":
+            status = "Running"
+
+        status_colours = {
+            "Up to Date": "#7ed39b",
+            "Out of Date": "#efb36b",
+            "Running": "#ef9d5b",
+            "Cancelling": "#efb36b",
+            "Failed": "#ef7785",
+            "Cancelled": "#b9bec8",
+            "Not Run": "#b9bec8",
+        }
+        if self._manual_status_label is not None:
+            self._manual_status_label.setText(status)
+            colour = status_colours.get(status, "#b9bec8")
+            self._manual_status_label.setStyleSheet(f"color:{colour}; font-weight:600;")
+
+        if status == "Out of Date":
+            detail_text = "Using the previous successful result. Current geometry or settings have not been applied."
+        elif status == "Up to Date":
+            detail_text = "The stored result matches the geometry and settings used for the last completed run."
+        elif status == "Failed" and node.parameters.get("_manual_last_error"):
+            detail_text = "The last attempt failed; the previous successful result is still being used."
+        elif status == "Cancelled":
+            detail_text = "The last request was cancelled. Any previous successful result remains available."
+        else:
+            detail_text = "Adjust settings freely, then run the action when ready. Parameter changes never start expensive work automatically."
+        if self._manual_detail_label is not None:
+            self._manual_detail_label.setText(detail_text)
+
+        error_text = str(node.parameters.get("_manual_last_error", "") or "").strip()
+        if self._manual_error_label is not None:
+            self._manual_error_label.setText(error_text)
+            self._manual_error_label.setVisible(bool(error_text))
+        if self._manual_error_caption is not None:
+            self._manual_error_caption.setVisible(bool(error_text))
+
+        if self._manual_action_button is not None and not running:
+            base_label = str(node.definition.manual_action_label or "Run")
+            if status == "Out of Date":
+                button_label = f"Re-{base_label}"
+            elif status == "Up to Date":
+                button_label = f"{base_label} Again"
+            else:
+                button_label = base_label
+            self._manual_action_button.setText(button_label)
+
     def _build_node(self, node: NodeItem) -> None:
         self.title.setText(node.definition.name)
         self.description.setText(node.definition.description or node.definition.category)
+
+        if node.definition.manual_action_label:
+            action_group = self._new_parameter_group(node, "Manual Execution", expanded=True)
+            status = str(node.parameters.get("_manual_status", "Not Run") or "Not Run")
+            running = status in {"Running", "Cancelling"} or (
+                bool(getattr(node, "_eval_active", False)) and status == "Running"
+            )
+            if running and status != "Cancelling":
+                status = "Running"
+            status_label = QLabel(status, action_group.body)
+            status_colours = {
+                "Up to Date": "#7ed39b",
+                "Out of Date": "#efb36b",
+                "Running": "#ef9d5b",
+                "Cancelling": "#efb36b",
+                "Failed": "#ef7785",
+                "Cancelled": "#b9bec8",
+                "Not Run": "#b9bec8",
+            }
+            if status in status_colours:
+                status_label.setStyleSheet(f"color:{status_colours[status]}; font-weight:600;")
+            self._manual_status_label = status_label
+            action_group.addRow("Status", status_label)
+
+            if status == "Out of Date":
+                detail_text = "Using the previous successful result. Current geometry or settings have not been applied."
+            elif status == "Up to Date":
+                detail_text = "The stored result matches the geometry and settings used for the last completed run."
+            elif status == "Failed" and node.parameters.get("_manual_last_error"):
+                detail_text = "The last attempt failed; the previous successful result is still being used."
+            elif status == "Cancelled":
+                detail_text = "The last request was cancelled. Any previous successful result remains available."
+            else:
+                detail_text = "Adjust settings freely, then run the action when ready. Parameter changes never start expensive work automatically."
+            detail = QLabel(detail_text, action_group.body)
+            detail.setObjectName("muted")
+            detail.setWordWrap(True)
+            self._manual_detail_label = detail
+            action_group.addRow("Behaviour", detail)
+
+            error_text = str(node.parameters.get("_manual_last_error", "") or "").strip()
+            error_caption = QLabel("Last error", action_group.body)
+            error_label = QLabel(error_text, action_group.body)
+            error_label.setStyleSheet("color:#ef7785;")
+            error_label.setWordWrap(True)
+            error_caption.setVisible(bool(error_text))
+            error_label.setVisible(bool(error_text))
+            self._manual_error_caption = error_caption
+            self._manual_error_label = error_label
+            action_group.addRow(error_caption, error_label)
+
+            action_button = QPushButton(action_group.body)
+            if running:
+                action_button.setText("Cancel")
+                action_button.setToolTip("Cancel this manual operation. The previous successful result remains unchanged.")
+                action_button.clicked.connect(
+                    lambda _checked=False, uid=node.uid: self.manualActionCancelRequested.emit(uid)
+                )
+            else:
+                base_label = str(node.definition.manual_action_label or "Run")
+                if status == "Out of Date":
+                    button_label = f"Re-{base_label}"
+                elif status == "Up to Date":
+                    button_label = f"{base_label} Again"
+                else:
+                    button_label = base_label
+                action_button.setText(button_label)
+                action_button.setToolTip(
+                    "Take a snapshot of the current geometry and settings, run in the background, and publish only a fully completed result."
+                )
+                action_button.clicked.connect(
+                    lambda _checked=False, uid=node.uid: self.manualActionRequested.emit(uid)
+                )
+            self._manual_action_button = action_button
+            action_group.addRow("Action", action_button)
+            self.form.addRow(action_group)
 
         if node.definition.type_id == "graph.instance":
             info = self._new_parameter_group(node, "Graph Asset", expanded=True)
@@ -3132,6 +3317,77 @@ class ParametersPanel(QWidget):
                 base.addRow("Output precision", precision)
             self.form.addRow(base)
 
+        has_geometry_output = any(
+            normalise_port_kind(node.definition.output_kind(name)) == "geometry"
+            for name in node.definition.output_names
+        )
+        if has_geometry_output and node.definition.type_id not in {"input.mesh", "geometry.decimate"}:
+            statistics = self._new_parameter_group(node, "Geometry Statistics", expanded=True)
+            output_vertices = node.parameters.get("_geometry_output_vertex_count")
+            output_triangles = node.parameters.get("_geometry_output_triangle_count")
+            output_memory = node.parameters.get("_geometry_output_memory_bytes")
+            input_vertices = node.parameters.get("_geometry_input_vertex_count")
+            input_triangles = node.parameters.get("_geometry_input_triangle_count")
+
+            def geometry_bytes(value) -> str:
+                amount = max(float(value or 0), 0.0)
+                units = ("B", "KiB", "MiB", "GiB")
+                index = 0
+                while amount >= 1024.0 and index < len(units) - 1:
+                    amount /= 1024.0
+                    index += 1
+                return f"{amount:.1f} {units[index]}"
+
+            if output_vertices is None or output_triangles is None:
+                pending = QLabel(
+                    "Preview this node to calculate its vertex and triangle counts.",
+                    statistics.body,
+                )
+                pending.setObjectName("muted")
+                pending.setWordWrap(True)
+                statistics.addRow("Output", pending)
+            else:
+                output = QLabel(
+                    f"{int(output_vertices):,} vertices · {int(output_triangles):,} triangles",
+                    statistics.body,
+                )
+                output.setObjectName("muted")
+                statistics.addRow("Output", output)
+                if output_memory is not None:
+                    memory = QLabel(geometry_bytes(output_memory), statistics.body)
+                    memory.setObjectName("muted")
+                    statistics.addRow("Mesh memory", memory)
+
+                if input_vertices is not None and input_triangles is not None:
+                    input_summary = QLabel(
+                        f"{int(input_vertices):,} vertices · {int(input_triangles):,} triangles",
+                        statistics.body,
+                    )
+                    input_summary.setObjectName("muted")
+                    statistics.addRow("Input", input_summary)
+                    if int(input_triangles) > 0:
+                        multiplier = float(output_triangles) / float(input_triangles)
+                        if multiplier >= 1.0:
+                            change_text = f"{multiplier:.2f}× input triangle count"
+                        else:
+                            change_text = f"{multiplier * 100.0:.2f}% of input triangles"
+                        change = QLabel(change_text, statistics.body)
+                        change.setObjectName("muted")
+                        statistics.addRow("Topology change", change)
+
+                if int(output_triangles) > AUTO_WIREFRAME_TRIANGLE_LIMIT:
+                    wireframe = QLabel(
+                        f"Auto wireframe is intentionally hidden above "
+                        f"{AUTO_WIREFRAME_TRIANGLE_LIMIT:,} triangles to avoid building and "
+                        "uploading a very large unique-edge buffer. The shaded mesh is complete; "
+                        "set 3D Preview → Wireframe to Always to force the overlay, which may be slow.",
+                        statistics.body,
+                    )
+                    wireframe.setStyleSheet("color:#efb36b;")
+                    wireframe.setWordWrap(True)
+                    statistics.addRow("Wireframe", wireframe)
+            self.form.addRow(statistics)
+
         if node.definition.type_id == "input.image":
             source_group = self._new_parameter_group(node, "Source Information", expanded=True)
             size = node.parameters.get("_source_size", [])
@@ -3157,6 +3413,420 @@ class ParametersPanel(QWidget):
                 error.setWordWrap(True)
                 source_group.addRow("Source error", error)
             self.form.addRow(source_group)
+
+        if node.definition.type_id == "input.mesh":
+            source_group = self._new_parameter_group(node, "Source Information", expanded=True)
+            vertices = node.parameters.get("_source_vertex_count")
+            triangles = node.parameters.get("_source_triangle_count")
+            has_uvs = node.parameters.get("_source_has_uvs")
+            has_normals = node.parameters.get("_source_has_normals")
+            objects = node.parameters.get("_source_object_count")
+            pending = bool(node.parameters.get("_source_pending", False))
+            if pending:
+                summary_text = (
+                    "Large OBJ selected. Geometry and topology diagnostics are being calculated "
+                    "in the background when the node is previewed."
+                )
+            elif vertices is not None and triangles is not None:
+                uv_text = "UVs present" if bool(has_uvs) else "no UVs"
+                normal_text = "normals present" if bool(has_normals) else "normals generated on import"
+                object_text = f"{int(objects or 1)} object/group name(s)"
+                summary_text = f"{int(vertices):,} vertices · {int(triangles):,} triangles · {uv_text} · {normal_text} · {object_text}"
+            else:
+                summary_text = "No readable OBJ source selected."
+            source = QLabel(summary_text, source_group.body)
+            source.setObjectName("muted")
+            source.setWordWrap(True)
+            source_group.addRow("Detected source", source)
+
+            def format_bytes(value) -> str:
+                amount = max(float(value or 0), 0.0)
+                units = ("B", "KiB", "MiB", "GiB")
+                index = 0
+                while amount >= 1024.0 and index < len(units) - 1:
+                    amount /= 1024.0
+                    index += 1
+                return f"{amount:.1f} {units[index]}"
+
+            memory_bytes = node.parameters.get("_source_memory_bytes")
+            file_bytes = node.parameters.get("_source_file_bytes")
+            if memory_bytes is not None or file_bytes is not None:
+                memory_parts = []
+                if file_bytes is not None:
+                    memory_parts.append(f"OBJ file {format_bytes(file_bytes)}")
+                if memory_bytes is not None:
+                    memory_parts.append(f"loaded mesh {format_bytes(memory_bytes)}")
+                memory = QLabel(" · ".join(memory_parts), source_group.body)
+                memory.setObjectName("muted")
+                source_group.addRow("Memory", memory)
+
+            if node.parameters.get("_source_triangle_count") is not None:
+                boundary = int(node.parameters.get("_source_boundary_edges", 0) or 0)
+                non_manifold = int(node.parameters.get("_source_non_manifold_edges", 0) or 0)
+                degenerates = int(node.parameters.get("_source_degenerate_triangles", 0) or 0)
+                duplicates = int(node.parameters.get("_source_duplicate_triangles", 0) or 0)
+                components = int(node.parameters.get("_source_connected_components", 0) or 0)
+                closed = bool(node.parameters.get("_source_closed_manifold", False))
+                topology_text = (
+                    "Closed manifold" if closed else
+                    f"{boundary:,} boundary edges · {non_manifold:,} non-manifold edges"
+                )
+                topology_text += (
+                    f" · {degenerates:,} degenerate triangles · {duplicates:,} duplicate triangles"
+                    f" · {components:,} connected component(s)"
+                )
+                topology = QLabel(topology_text, source_group.body)
+                topology.setObjectName("muted")
+                topology.setWordWrap(True)
+                source_group.addRow("Topology", topology)
+
+                unique_positions = int(node.parameters.get("_source_unique_position_count", vertices or 0) or 0)
+                uv_seams = int(node.parameters.get("_source_uv_seam_vertices", 0) or 0)
+                hard_seams = int(node.parameters.get("_source_hard_normal_seam_vertices", 0) or 0)
+                attributes = QLabel(
+                    f"{unique_positions:,} geometric positions · {uv_seams:,} UV-seam vertices · "
+                    f"{hard_seams:,} hard-normal seam vertices", source_group.body
+                )
+                attributes.setObjectName("muted")
+                attributes.setWordWrap(True)
+                source_group.addRow("Attribute seams", attributes)
+
+            if node.parameters.get("_source_error"):
+                error = QLabel(str(node.parameters["_source_error"]), source_group.body)
+                error.setStyleSheet("color:#ef7785;")
+                error.setWordWrap(True)
+                source_group.addRow("Source error", error)
+            resource_id = str(node.parameters.get("_resource_id", "") or "").strip()
+            if resource_id:
+                resource = QLabel(resource_id, source_group.body)
+                resource.setObjectName("muted")
+                resource.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                source_group.addRow("Graph resource", resource)
+            self.form.addRow(source_group)
+
+        if node.definition.type_id == "geometry.decimate":
+            diagnostics = self._new_parameter_group(node, "Simplification Diagnostics", expanded=True)
+            backend = str(node.parameters.get("_decimation_backend", "Not evaluated yet") or "Not evaluated yet")
+            backend_label = QLabel(backend, diagnostics.body)
+            backend_label.setObjectName("muted")
+            backend_label.setWordWrap(True)
+            diagnostics.addRow("Backend", backend_label)
+            target = node.parameters.get("_decimation_target_triangles")
+            output_triangles = node.parameters.get("_output_triangle_count")
+            output_vertices = node.parameters.get("_output_vertex_count")
+            if output_triangles is not None:
+                target_text = f"target {int(target or output_triangles):,} · output {int(output_triangles):,} triangles · {int(output_vertices or 0):,} vertices"
+                target_label = QLabel(target_text, diagnostics.body)
+                target_label.setObjectName("muted")
+                diagnostics.addRow("Result", target_label)
+                if "topology-protected" in backend.lower() and target is not None:
+                    pass_count = int(node.parameters.get("_decimation_pass_count", 1) or 1)
+                    if int(output_triangles) > int(target):
+                        pass_word = "pass" if pass_count == 1 else "passes"
+                        protection_text = (
+                            f"Re-planned native QEM from each watertight intermediate mesh for {pass_count} {pass_word}, "
+                            "but no further safe reduction was found before the pass limit or a no-progress state."
+                        )
+                    elif pass_count > 1:
+                        protection_text = (
+                            f"Reached the requested target after {pass_count} watertight QEM passes. "
+                            "Each pass generated a fresh collapse ordering from the previous closed result."
+                        )
+                    else:
+                        protection_text = (
+                            "The requested collapse ordering was trimmed to keep the closed mesh watertight."
+                        )
+                    protection = QLabel(protection_text, diagnostics.body)
+                    protection.setObjectName("muted")
+                    protection.setWordWrap(True)
+                    diagnostics.addRow("Topology protection", protection)
+                if "_output_closed_manifold" in node.parameters:
+                    boundary = int(node.parameters.get("_output_boundary_edges", 0) or 0)
+                    non_manifold = int(node.parameters.get("_output_non_manifold_edges", 0) or 0)
+                    degenerates = int(node.parameters.get("_output_degenerate_triangles", 0) or 0)
+                    closed = bool(node.parameters.get("_output_closed_manifold", False))
+                    quality_text = (
+                        "Closed manifold · no cracks detected" if closed else
+                        f"{boundary:,} boundary edges · {non_manifold:,} non-manifold edges · {degenerates:,} degenerate triangles"
+                    )
+                    quality = QLabel(quality_text, diagnostics.body)
+                    quality.setObjectName("muted")
+                    quality.setWordWrap(True)
+                    diagnostics.addRow("Output topology", quality)
+            warning_text = str(node.parameters.get("_decimation_warning", "") or "").strip()
+            if warning_text:
+                warning = QLabel(
+                    "Native simplification could not complete, so the slower compatibility fallback was used. "
+                    "If the details say the package is missing, run setup.sh or setup.bat again. Details: " + warning_text,
+                    diagnostics.body,
+                )
+                warning.setStyleSheet("color:#efb36b;")
+                warning.setWordWrap(True)
+                diagnostics.addRow("Warning", warning)
+            self.form.addRow(diagnostics)
+
+        if node.definition.type_id == "geometry.remesh":
+            diagnostics = self._new_parameter_group(node, "Remesh Diagnostics", expanded=True)
+            backend = QLabel(str(node.parameters.get("_remesh_backend", "Not run") or "Not run"), diagnostics.body)
+            backend.setObjectName("muted")
+            backend.setWordWrap(True)
+            diagnostics.addRow("Backend", backend)
+            voxel_size = node.parameters.get("_remesh_voxel_size")
+            if voxel_size is not None:
+                grid_x = int(node.parameters.get("_remesh_grid_x", 0) or 0)
+                grid_y = int(node.parameters.get("_remesh_grid_y", 0) or 0)
+                grid_z = int(node.parameters.get("_remesh_grid_z", 0) or 0)
+                filled = int(node.parameters.get("_remesh_filled_voxels", 0) or 0)
+                voxel = QLabel(
+                    f"{float(voxel_size):.6g} units · {grid_x:,} × {grid_y:,} × {grid_z:,} grid · {filled:,} filled voxels",
+                    diagnostics.body,
+                )
+                voxel.setObjectName("muted")
+                voxel.setWordWrap(True)
+                diagnostics.addRow("Voxel volume", voxel)
+            output_triangles = node.parameters.get("_remesh_output_triangle_count")
+            if output_triangles is not None:
+                input_triangles = int(node.parameters.get("_remesh_input_triangle_count", 0) or 0)
+                output_vertices = int(node.parameters.get("_remesh_output_vertex_count", 0) or 0)
+                topology = QLabel(
+                    f"{input_triangles:,} input triangles → {int(output_triangles):,} output triangles · {output_vertices:,} vertices",
+                    diagnostics.body,
+                )
+                topology.setObjectName("muted")
+                diagnostics.addRow("Topology", topology)
+                closed = bool(node.parameters.get("_remesh_output_closed_manifold", False))
+                boundary = int(node.parameters.get("_remesh_output_boundary_edges", 0) or 0)
+                non_manifold = int(node.parameters.get("_remesh_output_non_manifold_edges", 0) or 0)
+                components = int(node.parameters.get("_remesh_output_connected_components", 0) or 0)
+                quality_text = (
+                    f"Closed manifold · {components:,} connected component(s)"
+                    if closed
+                    else f"{boundary:,} boundary edges · {non_manifold:,} non-manifold edges · {components:,} connected component(s)"
+                )
+                quality = QLabel(quality_text, diagnostics.body)
+                quality.setObjectName("muted")
+                quality.setWordWrap(True)
+                if not closed:
+                    quality.setStyleSheet("color:#efb36b;")
+                diagnostics.addRow("Output quality", quality)
+                adaptivity = float(node.parameters.get("_remesh_adaptivity", 0.0) or 0.0)
+                if adaptivity > 0.0:
+                    adapt_backend = str(node.parameters.get("_remesh_adaptivity_backend", "Unknown") or "Unknown")
+                    adapt = QLabel(f"{adaptivity:.2f} · {adapt_backend}", diagnostics.body)
+                    adapt.setObjectName("muted")
+                    adapt.setWordWrap(True)
+                    diagnostics.addRow("Adaptivity", adapt)
+            uv_note = QLabel(
+                "Remeshing creates entirely new topology, so source UVs are intentionally discarded. Place Geometry UV Unwrap after this node.",
+                diagnostics.body,
+            )
+            uv_note.setObjectName("muted")
+            uv_note.setWordWrap(True)
+            diagnostics.addRow("UVs", uv_note)
+            self.form.addRow(diagnostics)
+
+        if node.definition.type_id == "geometry.delete_small_parts":
+            diagnostics = self._new_parameter_group(node, "Component Cleanup", expanded=True)
+            backend = QLabel(str(node.parameters.get("_parts_backend", "Not evaluated yet") or "Not evaluated yet"), diagnostics.body)
+            backend.setObjectName("muted")
+            diagnostics.addRow("Backend", backend)
+            input_components = node.parameters.get("_parts_input_components")
+            if input_components is not None:
+                output_components = int(node.parameters.get("_parts_output_components", 0) or 0)
+                removed_components = int(node.parameters.get("_parts_removed_components", 0) or 0)
+                components = QLabel(
+                    f"{int(input_components):,} input · {output_components:,} kept · {removed_components:,} removed",
+                    diagnostics.body,
+                )
+                components.setObjectName("muted")
+                diagnostics.addRow("Components", components)
+                removed_vertices = int(node.parameters.get("_parts_removed_vertices", 0) or 0)
+                removed_triangles = int(node.parameters.get("_parts_removed_triangles", 0) or 0)
+                removed = QLabel(
+                    f"{removed_vertices:,} vertices · {removed_triangles:,} triangles",
+                    diagnostics.body,
+                )
+                removed.setObjectName("muted")
+                diagnostics.addRow("Deleted", removed)
+                measure = str(node.parameters.get("_parts_measure", "Vertex Count") or "Vertex Count")
+                largest_vertices = int(node.parameters.get("_parts_largest_vertices", 0) or 0)
+                largest_triangles = int(node.parameters.get("_parts_largest_triangles", 0) or 0)
+                largest = QLabel(
+                    f"{largest_vertices:,} geometric vertices · {largest_triangles:,} triangles · ranked by {measure}",
+                    diagnostics.body,
+                )
+                largest.setObjectName("muted")
+                largest.setWordWrap(True)
+                diagnostics.addRow("Largest part", largest)
+            self.form.addRow(diagnostics)
+
+        if node.definition.type_id == "geometry.bake_high_to_low":
+            diagnostics = self._new_parameter_group(node, "Bake Diagnostics", expanded=True)
+            backend = QLabel(str(node.parameters.get("_bake_backend", "Not run") or "Not run"), diagnostics.body)
+            backend.setObjectName("muted")
+            backend.setWordWrap(True)
+            diagnostics.addRow("Backend", backend)
+            resolution = node.parameters.get("_bake_resolution")
+            if resolution is not None:
+                supersampling = int(node.parameters.get("_bake_supersampling", 1) or 1)
+                maps = node.parameters.get("_bake_maps", ()) or ()
+                if isinstance(maps, str):
+                    maps = (maps,)
+                result = QLabel(
+                    f"{int(resolution):,} × {int(resolution):,} · {supersampling}× supersampling · "
+                    f"{', '.join(str(value) for value in maps) or 'no maps'}",
+                    diagnostics.body,
+                )
+                result.setObjectName("muted")
+                result.setWordWrap(True)
+                diagnostics.addRow("Result", result)
+                hit_percent = float(node.parameters.get("_bake_hit_percent", 0.0) or 0.0)
+                hit_pixels = int(node.parameters.get("_bake_hit_pixels", 0) or 0)
+                missed_pixels = int(node.parameters.get("_bake_missed_pixels", 0) or 0)
+                projection = QLabel(
+                    f"{hit_percent:.2f}% coverage · {hit_pixels:,} projected samples · {missed_pixels:,} misses",
+                    diagnostics.body,
+                )
+                projection.setObjectName("muted")
+                projection.setWordWrap(True)
+                if missed_pixels:
+                    projection.setStyleSheet("color:#efb36b;")
+                diagnostics.addRow("Projection", projection)
+                front = int(node.parameters.get("_bake_front_hits", 0) or 0)
+                back = int(node.parameters.get("_bake_back_hits", 0) or 0)
+                distances = QLabel(
+                    f"{front:,} front · {back:,} back · "
+                    f"range {float(node.parameters.get('_bake_front_distance', 0.0) or 0.0):.6g} / "
+                    f"{float(node.parameters.get('_bake_back_distance', 0.0) or 0.0):.6g}",
+                    diagnostics.body,
+                )
+                distances.setObjectName("muted")
+                distances.setWordWrap(True)
+                diagnostics.addRow("Ray hits", distances)
+                height_min = float(node.parameters.get("_bake_height_min", 0.0) or 0.0)
+                height_max = float(node.parameters.get("_bake_height_max", 0.0) or 0.0)
+                height = QLabel(f"{height_min:.6g} to {height_max:.6g} object units", diagnostics.body)
+                height.setObjectName("muted")
+                diagnostics.addRow("Signed height", height)
+                overlap = int(node.parameters.get("_bake_overlap_pixels", 0) or 0)
+                ao_samples = int(node.parameters.get("_bake_ao_samples", 0) or 0)
+                quality = QLabel(
+                    f"{overlap:,} overlapping low-UV texels · {ao_samples:,} AO samples · "
+                    f"{int(node.parameters.get('_bake_padding_pixels', 0) or 0):,} px padding",
+                    diagnostics.body,
+                )
+                quality.setObjectName("muted")
+                quality.setWordWrap(True)
+                if overlap:
+                    quality.setStyleSheet("color:#efb36b;")
+                diagnostics.addRow("Quality", quality)
+                zero_uv = int(node.parameters.get("_bake_low_uv_zero_area_triangles", 0) or 0)
+                outside_uv = int(node.parameters.get("_bake_low_uv_out_of_bounds_vertices", 0) or 0)
+                estimated_memory = max(float(node.parameters.get("_bake_estimated_working_memory_bytes", 0) or 0), 0.0)
+                memory_units = ("B", "KiB", "MiB", "GiB")
+                memory_index = 0
+                while estimated_memory >= 1024.0 and memory_index < len(memory_units) - 1:
+                    estimated_memory /= 1024.0
+                    memory_index += 1
+                validation = QLabel(
+                    f"{zero_uv:,} zero-area low-UV triangles · {outside_uv:,} out-of-bounds UV vertices · "
+                    f"about {estimated_memory:.1f} {memory_units[memory_index]} working memory",
+                    diagnostics.body,
+                )
+                validation.setObjectName("muted")
+                validation.setWordWrap(True)
+                if zero_uv or outside_uv:
+                    validation.setStyleSheet("color:#efb36b;")
+                diagnostics.addRow("Validation", validation)
+                elapsed = float(node.parameters.get("_bake_elapsed_ms", 0.0) or 0.0)
+                timing = QLabel(
+                    f"{elapsed / 1000.0:.2f} s total · "
+                    f"{float(node.parameters.get('_bake_projection_ms', 0.0) or 0.0) / 1000.0:.2f} s projection · "
+                    f"{float(node.parameters.get('_bake_ao_ms', 0.0) or 0.0) / 1000.0:.2f} s AO",
+                    diagnostics.body,
+                )
+                timing.setObjectName("muted")
+                timing.setWordWrap(True)
+                diagnostics.addRow("Timing", timing)
+            warnings = node.parameters.get("_bake_warnings", ()) or ()
+            if isinstance(warnings, str):
+                warnings = (warnings,)
+            if warnings:
+                warning = QLabel("\n".join(str(value) for value in warnings), diagnostics.body)
+                warning.setStyleSheet("color:#efb36b;")
+                warning.setWordWrap(True)
+                diagnostics.addRow("Warning", warning)
+            hint = QLabel(
+                "The Baked Material output carries Albedo, Normal, Height and AO to Material workflows; individual map sockets remain available for processing and export.",
+                diagnostics.body,
+            )
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            diagnostics.addRow("Outputs", hint)
+            self.form.addRow(diagnostics)
+
+        if node.definition.type_id == "geometry.uv_unwrap":
+            diagnostics = self._new_parameter_group(node, "UV Diagnostics", expanded=True)
+            backend = QLabel(str(node.parameters.get("_uv_backend", "Not run") or "Not run"), diagnostics.body)
+            backend.setObjectName("muted")
+            diagnostics.addRow("Backend", backend)
+            islands = node.parameters.get("_uv_island_count")
+            coverage = node.parameters.get("_uv_coverage")
+            if islands is not None:
+                layout_label = QLabel(
+                    f"{int(islands):,} islands · {float(coverage or 0.0) * 100.0:.1f}% atlas coverage",
+                    diagnostics.body,
+                )
+                layout_label.setObjectName("muted")
+                diagnostics.addRow("Layout", layout_label)
+            atlas_width = node.parameters.get("_uv_atlas_width")
+            atlas_height = node.parameters.get("_uv_atlas_height")
+            if atlas_width is not None and atlas_height is not None:
+                page_count = int(node.parameters.get("_uv_atlas_page_count", 1) or 1)
+                atlas_text = f"{int(atlas_width):,} × {int(atlas_height):,}"
+                if page_count > 1:
+                    atlas_text += f" · {page_count} xatlas pages combined"
+                atlas = QLabel(atlas_text, diagnostics.body)
+                atlas.setObjectName("muted")
+                diagnostics.addRow("Packed atlas", atlas)
+            overlap_count = int(node.parameters.get("_uv_overlap_triangle_count", 0) or 0)
+            zero_area = int(node.parameters.get("_uv_zero_area_triangle_count", 0) or 0)
+            outside = int(node.parameters.get("_uv_out_of_bounds_vertex_count", 0) or 0)
+            overlap_limited = bool(node.parameters.get("_uv_overlap_analysis_limited", False))
+            if overlap_limited:
+                quality_text = (
+                    f"Dense layout: exhaustive overlap testing was limited · "
+                    f"{zero_area:,} zero-area triangles · {outside:,} out-of-bounds vertices"
+                )
+            else:
+                quality_text = (
+                    "No overlaps, zero-area UV triangles or out-of-bounds vertices detected"
+                    if overlap_count == 0 and zero_area == 0 and outside == 0
+                    else f"{overlap_count:,} overlapping triangles · {zero_area:,} zero-area triangles · {outside:,} out-of-bounds vertices"
+                )
+            quality = QLabel(quality_text, diagnostics.body)
+            quality.setObjectName("muted")
+            quality.setWordWrap(True)
+            if overlap_limited or overlap_count or zero_area or outside:
+                quality.setStyleSheet("color:#efb36b;")
+            diagnostics.addRow("Validation", quality)
+            if bool(node.parameters.get("_uv_preview_sampled", False)):
+                preview_count = int(node.parameters.get("_uv_preview_triangle_count", 0) or 0)
+                sampled = QLabel(
+                    f"Dense atlas preview is showing {preview_count:,} representative triangles; the stored mesh and UV result remain complete.",
+                    diagnostics.body,
+                )
+                sampled.setObjectName("muted")
+                sampled.setWordWrap(True)
+                diagnostics.addRow("Dense preview", sampled)
+            hint = QLabel(
+                "The 2D Preview shows the UV atlas. Connect Preview Texture to inspect distortion without changing or invalidating the unwrap result.",
+                diagnostics.body,
+            )
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            diagnostics.addRow("Preview", hint)
+            self.form.addRow(diagnostics)
 
         if node.definition.type_id == "input.canvas":
             canvas_group = self._new_parameter_group(node, "Canvas", expanded=True)
@@ -3467,12 +4137,20 @@ class ParametersPanel(QWidget):
         self._schedule_adjustment_histogram()
 
     def _interactive_edit_started(self, node_uid: str) -> None:
+        self._interactive_parameter_depth += 1
         self._histogram_interaction_started(node_uid)
         self.interactiveEditStarted.emit(str(node_uid))
 
     def _interactive_edit_finished(self, node_uid: str) -> None:
         self._histogram_interaction_finished(node_uid)
         self.interactiveEditFinished.emit(str(node_uid))
+        self._interactive_parameter_depth = max(self._interactive_parameter_depth - 1, 0)
+        if self._interactive_parameter_depth > 0 or not self._deferred_same_item_refresh:
+            return
+        self._deferred_same_item_refresh = False
+        current = self.scene.nodes.get(str(node_uid))
+        if current is not None:
+            QTimer.singleShot(0, lambda node=current: self.set_item(node))
 
     def _schedule_adjustment_histogram(self) -> None:
         if self._histogram_interaction_depth > 0:
@@ -4202,6 +4880,25 @@ class ParametersPanel(QWidget):
         if self._building:
             return
         self.scene.change_node_parameter(node, spec.name, value, label=f"Change {spec.label}")
+        manual_relevant = (
+            bool(node.definition.manual_action_label)
+            and spec.name in set(node.definition.manual_action_relevant_parameters)
+        )
+        if manual_relevant and node.parameters.get("_manual_result_data"):
+            # GraphScene applies the lightweight setting and derives whether it
+            # now matches the last successful manual run. Keeping that logic in
+            # one place also makes undo/redo restore Up to Date correctly.
+            self.scene._refresh_manual_parameter_status(node)
+            self._refresh_manual_execution_summary(node)
+        refreshes_mesh_source = (
+            node.definition.type_id == "input.mesh" and spec.name in {"path", "embedded"}
+        )
+        if refreshes_mesh_source:
+            try:
+                from ..geometry import refresh_mesh_metadata
+                refresh_mesh_metadata(node.parameters)
+            except Exception:
+                pass
         self._notify_visual_preview(node)
         changes_parameter_layout = any(
             any(controller_name == spec.name for controller_name, _allowed in candidate.visible_when)
@@ -4213,7 +4910,7 @@ class ParametersPanel(QWidget):
             or (node.definition.type_id == "graph.send" and spec.name == "channel_name")
             or (node.definition.type_id == "graph.receive" and spec.name == "sender_uid")
         )
-        if changes_parameter_layout or changes_resolved_type:
+        if changes_parameter_layout or changes_resolved_type or refreshes_mesh_source:
             scroll_value = self.scroll.verticalScrollBar().value()
             current = self.scene.nodes.get(node.uid)
             if current is not None:
@@ -4233,6 +4930,13 @@ class ParametersPanel(QWidget):
                     from ..nodes.input_nodes import refresh_image_metadata
                     refresh_image_metadata(item.parameters)
                     self.scene._resolve_dynamic_types()
+                    self.scene._refresh_all_groups()
+                except Exception:
+                    pass
+            elif item.definition.type_id == "input.mesh":
+                try:
+                    from ..geometry import refresh_mesh_metadata
+                    refresh_mesh_metadata(item.parameters)
                     self.scene._refresh_all_groups()
                 except Exception:
                     pass

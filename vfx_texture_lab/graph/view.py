@@ -11,7 +11,10 @@ from ..theme import theme_colour
 from ..ui.node_preferences import NodePreferences
 from ..ui.search import NodeSearchDialog
 from .items import ConnectionItem, GroupFrameItem, NodeItem, PortItem, RerouteItem
-from .mime import GRAPH_ASSET_MIME_TYPE, NODE_MIME_TYPE, OPEN_GRAPH_MIME_TYPE, SELECTION_MIME_TYPE, USER_NODE_MIME_TYPE
+from .mime import (
+    GRAPH_ASSET_MIME_TYPE, GRAPH_RESOURCE_MIME_TYPE, NODE_MIME_TYPE,
+    OPEN_GRAPH_MIME_TYPE, SELECTION_MIME_TYPE, USER_NODE_MIME_TYPE,
+)
 from .scene import GraphScene
 
 
@@ -20,10 +23,12 @@ class GraphView(QGraphicsView):
     exportOutputsRequested = Signal(object)
     graphAssetOpenRequested = Signal(str)
     openGraphInstanceRequested = Signal(str, object)
+    graphResourceDropRequested = Signal(str, str, object)
     viewportChanged = Signal()
     backgroundClicked = Signal()
     inspectorItemClicked = Signal(object)
     IMAGE_SUFFIXES = {".png", ".tga", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    MESH_SUFFIXES = {".obj"}
     AUTO_PAN_MARGIN = 42
     AUTO_PAN_MAX_STEP = 28
     PORT_SNAP_RADIUS_PX = 32.0
@@ -359,7 +364,10 @@ class GraphView(QGraphicsView):
                         self.graph_scene.toggle_node_thumbnail(node_item)
                 event.accept()
                 return
-        if isinstance(node_item, NodeItem) and node_item.definition.type_id == "input.image":
+        if isinstance(node_item, NodeItem) and node_item.definition.type_id in {"input.image", "input.mesh"}:
+            is_mesh = node_item.definition.type_id == "input.mesh"
+            noun = "Mesh" if is_mesh else "Image"
+            plural = "Meshes" if is_mesh else "Images"
             menu = QMenu(self)
             source_text = str(node_item.parameters.get("path", "") or "").strip()
             resolved_source = self._resolved_authored_path(source_text)
@@ -377,49 +385,61 @@ class GraphView(QGraphicsView):
                     and resolved_packaged_source.is_file()
                 )
             )
-            relink = menu.addAction("Relink Image…")
-            matching_count = len(self.graph_scene.matching_image_inputs(node_item))
-            relink_all = menu.addAction(f"Relink All Matching Images… ({matching_count})")
+            relink = menu.addAction(f"Relink {noun}…")
+            matching_count = len(self.graph_scene.matching_file_inputs(node_item))
+            relink_all = menu.addAction(f"Relink All Matching {plural}… ({matching_count})")
             relink_all.setEnabled(matching_count > 1)
-            make_local = menu.addAction("Make Local / Embed Image")
+            make_local = menu.addAction(f"Make Local / Embed {noun}")
             make_local.setEnabled(bool(embedded_data or (resolved_source is not None and resolved_source.is_file())))
             restore = menu.addAction("Restore Embedded Copy As…")
             restore.setEnabled(bool(embedded_data))
             menu.addSeparator()
-            reveal = menu.addAction("Reveal Image in File Manager")
+            reveal = menu.addAction(f"Reveal {noun} in File Manager")
             reveal.setEnabled(bool(resolved_source is not None and resolved_source.exists()))
             chosen = menu.exec(event.globalPos())
             try:
                 if chosen is use_packaged_source and resolved_packaged_source is not None:
-                    self.graph_scene.relink_image_inputs(
+                    self.graph_scene.relink_file_inputs(
                         node_item, resolved_packaged_source, matching=False
                     )
                 elif chosen in (relink, relink_all):
+                    file_filter = (
+                        "Wavefront OBJ meshes (*.obj);;All files (*)"
+                        if is_mesh else
+                        "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)"
+                    )
                     filename, _selected = QFileDialog.getOpenFileName(
-                        self, "Relink Image", source_text or str(Path.home()),
-                        "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)",
+                        self, f"Relink {noun}", source_text or str(Path.home()), file_filter,
                     )
                     if filename:
-                        count = self.graph_scene.relink_image_inputs(
+                        count = self.graph_scene.relink_file_inputs(
                             node_item, filename, matching=chosen is relink_all
                         )
                         if count > 1:
-                            QMessageBox.information(self, "Images relinked", f"Relinked {count} matching Image Input nodes.")
+                            QMessageBox.information(
+                                self, f"{plural} relinked",
+                                f"Relinked {count} matching {noun} Input nodes."
+                            )
                 elif chosen is make_local:
-                    if not self.graph_scene.embed_image_input(node_item, source_path=resolved_source):
-                        raise ValueError("The image source and embedded recovery copy are both unavailable.")
+                    if not self.graph_scene.embed_file_input(node_item, source_path=resolved_source):
+                        raise ValueError(f"The {noun.casefold()} source and embedded recovery copy are both unavailable.")
                 elif chosen is restore:
-                    suggested = str(node_item.parameters.get("_embedded_name", "") or "restored-image.png")
+                    fallback = "restored-mesh.obj" if is_mesh else "restored-image.png"
+                    suggested = str(node_item.parameters.get("_embedded_name", "") or fallback)
+                    file_filter = (
+                        "Wavefront OBJ meshes (*.obj);;All files (*)"
+                        if is_mesh else
+                        "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)"
+                    )
                     filename, _selected = QFileDialog.getSaveFileName(
-                        self, "Restore Embedded Image", str(Path.home() / suggested),
-                        "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)",
+                        self, f"Restore Embedded {noun}", str(Path.home() / suggested), file_filter,
                     )
                     if filename:
-                        self.graph_scene.restore_embedded_image(node_item, filename, relink=True)
+                        self.graph_scene.restore_embedded_file(node_item, filename, relink=True)
                 elif chosen is reveal and resolved_source is not None:
                     QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved_source.parent)))
             except Exception as exc:
-                QMessageBox.warning(self, "Image recovery failed", str(exc))
+                QMessageBox.warning(self, f"{noun} recovery failed", str(exc))
             event.accept()
             return
 
@@ -935,6 +955,33 @@ class GraphView(QGraphicsView):
                 return str(path)
         return None
 
+    def _first_dropped_mesh(self, mime) -> str | None:
+        if not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in self.MESH_SUFFIXES:
+                return str(path)
+        return None
+
+    @staticmethod
+    def _dropped_graph_resource(mime) -> tuple[str, str] | None:
+        if not mime.hasFormat(GRAPH_RESOURCE_MIME_TYPE):
+            return None
+        try:
+            payload = json.loads(bytes(mime.data(GRAPH_RESOURCE_MIME_TYPE)).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        graph_uid = str(payload.get("graph_uid", "") or "").strip()
+        resource_uid = str(payload.get("resource_uid", "") or "").strip()
+        if not graph_uid or not resource_uid:
+            return None
+        return graph_uid, resource_uid
+
     @staticmethod
     def _dropped_open_graph_uid(mime) -> str | None:
         if not mime.hasFormat(OPEN_GRAPH_MIME_TYPE):
@@ -999,8 +1046,10 @@ class GraphView(QGraphicsView):
             event.mimeData().hasFormat(NODE_MIME_TYPE)
             or event.mimeData().hasFormat(USER_NODE_MIME_TYPE)
             or open_graph_uid
+            or self._dropped_graph_resource(event.mimeData())
             or self._first_dropped_graph(event.mimeData())
             or self._first_dropped_image(event.mimeData())
+            or self._first_dropped_mesh(event.mimeData())
         ):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
@@ -1020,8 +1069,10 @@ class GraphView(QGraphicsView):
             mime.hasFormat(NODE_MIME_TYPE)
             or mime.hasFormat(USER_NODE_MIME_TYPE)
             or open_graph_uid
+            or self._dropped_graph_resource(mime)
             or self._first_dropped_graph(mime)
             or self._first_dropped_image(mime)
+            or self._first_dropped_mesh(mime)
         ):
             type_id = self._mime_node_type(mime)
             if type_id and self.graph_scene.registry.contains(type_id):
@@ -1058,6 +1109,14 @@ class GraphView(QGraphicsView):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
             return
+        graph_resource = self._dropped_graph_resource(event.mimeData())
+        if graph_resource is not None:
+            self._set_drag_insert_candidate(None)
+            source_graph_uid, resource_uid = graph_resource
+            self.graphResourceDropRequested.emit(source_graph_uid, resource_uid, scene_position)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
         graph_path = self._first_dropped_graph(event.mimeData())
         if graph_path:
             self._set_drag_insert_candidate(None)
@@ -1073,6 +1132,18 @@ class GraphView(QGraphicsView):
             self.graph_scene.clearSelection()
             node = self.graph_scene.create_node(
                 "input.image", scene_position, parameters={"path": image_path}
+            )
+            node.setSelected(True)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            self._refresh_scene_bounds()
+            return
+        mesh_path = self._first_dropped_mesh(event.mimeData())
+        if mesh_path:
+            self._set_drag_insert_candidate(None)
+            self.graph_scene.clearSelection()
+            node = self.graph_scene.create_node(
+                "input.mesh", scene_position, parameters={"path": mesh_path}
             )
             node.setSelected(True)
             event.setDropAction(Qt.DropAction.CopyAction)

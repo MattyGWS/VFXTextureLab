@@ -1,5 +1,207 @@
 # Changelog
 
+## 0.53.0.3 — Mirrored UV Tangent-Space Consistency
+
+- Fixed tangent-space normal bakes appearing to need a manual Red/X inversion on mirrored xatlas or imported UV islands. The tangent formula had normalised its numerator without retaining the UV determinant sign, so +U and +V silently pointed backwards on mirrored charts.
+- Geometry Bake High to Low now applies the determinant orientation per triangle before constructing the low-poly tangent and bitangent basis. This produces standards-consistent encoded normal directions instead of a global channel workaround.
+- The 3D Preview shader uses the same corrected basis, so newly baked maps display consistently inside VFX Texture Lab and in external tools. Existing non-mirrored charts are unchanged.
+- Added regression coverage for mirrored UV tangent direction and a direct high-to-low normal bake, plus a shader guard ensuring the determinant sign remains part of viewport tangent reconstruction.
+- This is a source-only correction. Existing 0.53.0 users do not need to rerun setup. Graph format remains **20** and the built-in registry remains at **187 node types**.
+
+## 0.53.0.2 — 3D UV Origin Preview Fix
+
+- Fixed imported, xatlas-unwrapped and baked low-poly meshes appearing vertically shifted against their textures in the 3D Preview even though the same exported OBJ and bake aligned correctly in Blender. The bake and exported UV data were valid; the preview renderer had interpreted standard bottom-left OBJ UVs as top-left image coordinates.
+- Geometry values now carry an explicit UV-origin convention. OBJ imports and UV Unwrap results are marked as standard bottom-left UVs, while existing procedural generators retain their current top-left convention for backwards compatibility. Geometry processing, manual-result persistence and bake-result persistence preserve this metadata.
+- The 3D shader now flips only the texture-sampling V coordinate when a mesh uses bottom-left UVs. It keeps a separate authored UV coordinate for tangent-basis reconstruction, so tangent-space normal maps remain oriented correctly instead of silently changing handedness.
+- Bake rasterisation, high-albedo transfer, UV diagnostics and the 2D UV Preview normalise to standard bottom-left UV space. Geometry Combine reconciles mixed conventions, Geometry Displace samples either convention correctly, and OBJ export always writes standard UVs.
+- Added focused regression coverage for UV-origin conversion, projection unwrap output, bake persistence, standards-compatible OBJ export and separate preview-sampling/tangent UV shader paths. This is source-only; existing 0.53.0 users do not need to rerun setup. Graph format remains **20** and the built-in registry remains at **187 node types**.
+
+## 0.53.0.1 — Native Bake Projection Fix
+
+- Fixed Geometry Bake High to Low failing on the first successful native Embree hit with `NameError: name 'trimesh' is not defined`. The optional trimesh dependency was imported lazily while constructing the native intersector, but its barycentric-coordinate helper was referenced later from a different method where that local import was no longer in scope.
+- The native intersector now retains the barycentric helper on its instance, preserving lazy optional-dependency loading while allowing Albedo, Normal and Height projection to complete through Embree.
+- Added a focused native-hit regression test so packaged and source builds verify triangle IDs, distances and barycentric coordinates without requiring the full GUI.
+- This is a source-only correction. Users who already ran setup for 0.53.0 do not need to rerun it. Graph format remains **20** and the built-in registry remains at **187 node types**.
+
+## 0.53.0 — High-to-Low Geometry Baking
+
+- Added **Geometry Bake High to Low**, a manually executed and transactional photogrammetry baker. It accepts High Geometry, UV-unwrapped Low Geometry, optional High Albedo and optional matching Cage Geometry, then publishes a reusable Baked Material, Albedo, tangent-space Normal, signed Height, Ambient Occlusion, Projection Mask and Low Geometry outputs.
+- Added sane one-click defaults: 1024² output, bidirectional normal projection, automatic ray distances, 16-pixel island padding, OpenGL tangent normals, automatic symmetric height encoding and Draft AO. Missing High Albedo skips only the Albedo pass so geometry-derived maps still complete.
+- Added a versioned, map-oriented persistent bake-result container. Completed maps survive graph save/reopen, remain available while settings are Out of Date or a replacement bake is running, and can accept additional Substance-style bake outputs in later releases without redesigning the manual execution model.
+- Added background Bake/Re-Bake/Cancel execution with orange activity wires, cancellable progress stages and transactional publication. Failed or cancelled work never replaces the previous successful result.
+- Added a cross-platform CPU ray backend through `embreex`/Embree, a bounded NumPy reference path for tiny meshes and cached high-poly acceleration structures. Windows packaging now collects and smoke-tests the native Embree runtime; Linux and source installs request binary wheels rather than compiling locally.
+- Added low-UV rasterisation, front/back/cage projection, direct high-surface normal transfer, signed ray-distance height, high-UV albedo transfer, deterministic hemisphere AO, supersampling and island padding.
+- Added detailed bake diagnostics for backend, enabled maps, UV coverage, hit/miss percentage, front/back hit counts, overlap pixels, measured height range, AO samples, timings, padding and warnings. Projection Mask provides an explicit debug output for missed texels.
+- The 2D Preview can switch among completed bake maps without invalidating the bake. The 3D Preview applies available Albedo, Normal, Height and AO maps together to the low-poly mesh.
+- Graph format remains **20**. The built-in registry now contains **187 node types**.
+
+## 0.52.1.1 — 3D UV Checker Fallback
+
+- Geometry UV Unwrap now applies a neutral checkerboard to the unwrapped mesh in the 3D Preview whenever no Preview Texture is connected, matching the textureless checker reference already shown beneath the UV layout in 2D.
+- The fallback is presentation-only, shared between evaluations and excluded from manual-result persistence and unwrap signatures. Connecting or disconnecting a Preview Texture therefore remains immediate and never requests another unwrap.
+- Updated the geometry-preview status text to describe both connected textures and the automatic checker as a UV surface preview.
+- This is a source-only correction. Existing 0.52.1 users do not need to rerun setup. Graph format remains **20** and the built-in registry remains at **186 node types**.
+
+## 0.52.1 — Voxel Remesh and Scan Cleanup
+
+- Added **Geometry Remesh**, a manual-action voxel remesher for photogrammetry cleanup and uniform topology. It supports relative or absolute object-space voxel size, interior filling, field smoothing, volume preservation and optional shape-aware adaptivity. The operation runs on the cancellable geometry worker, publishes transactionally, preserves the last successful result while settings are stale and persists its completed mesh in the graph.
+- Geometry Remesh reconstructs a fresh closed triangle surface with smooth normals, preserves the authored object-space centre and intentionally discards invalidated source UVs. The Inspector reports voxel dimensions, filled-cell count, input/output topology, manifold quality and adaptivity backend. Unsafe voxel-grid requests are rejected before large allocations.
+- Added **Geometry Delete Small Parts** for scan cleanup. It detects disconnected geometric components across UV and hard-normal seam copies, keeps the largest part automatically, or retains all parts above a configurable percentage of the largest using geometric vertex count, triangle count or surface area. Unused vertices and discarded fragments are compacted out of the result.
+- Finished the **Best Packing** interaction fix. Manual-setting edits with a persisted result now use a small parameter-only undo command instead of taking and comparing two complete graph snapshots containing the compressed mesh payload. Slider, checkbox and undo/redo edits update stale/current state without decoding or copying the saved result and without scheduling an unchanged geometry preview.
+- Added `trimesh`, `scipy` and `scikit-image` as wheel-installed runtime dependencies, explicit frozen-build collection and a packaged voxel-remesh smoke test. Source users upgrading to 0.52.1 must run `setup.sh` or `setup.bat` once.
+- Graph format remains **20**. The built-in registry now contains **186 node types**.
+
+## 0.52.0.3 — Textured UV Inspection and Faster Manual Edits
+
+- Geometry UV Unwrap now applies its optional **Preview Texture** as Base Colour on the unwrapped mesh in the 3D Preview while continuing to display the same texture beneath the UV atlas in 2D. This remains presentation-only: swapping or disconnecting the texture does not invalidate the unwrap or change the stored geometry.
+- Cached UV presentations now retain the lightweight 3D preview texture alongside the UV overlay, so focus changes and presentation-cache hits restore both views consistently. Disconnecting the texture returns the mesh to neutral shaded geometry inspection.
+- Added a compact persistent-result revision digest for manual-action nodes. Branch cache keys no longer serialise the potentially multi-megabyte compressed unwrap payload whenever an unapplied control such as **Best Packing** changes, removing an avoidable UI-thread pause. Existing 0.52 graphs fall back to their stored source/settings signature until the next manual run publishes the compact digest.
+- Updated Geometry UV Unwrap help text and testing guidance to describe the shared 2D/3D preview behaviour.
+- This is a source-only correction. Existing 0.52.0 users do not need to rerun setup.
+
+## 0.52.0.2 — Stable Manual-Node Inspector Editing
+
+- Fixed Geometry UV Unwrap parameter edits rebuilding the entire Inspector for every intermediate slider value. The rebuild destroyed the control under the pointer and jumped the user back to the Manual Execution section, making lower controls effectively impossible to drag.
+- Manual-action nodes now update their Out of Date status, explanatory text, error visibility and Re-Unwrap button in place without reconstructing any parameter controls.
+- Same-node Inspector refreshes now preserve the current vertical scroll position instead of returning to the top.
+- Background/status refresh requests received during an active slider or dial interaction are deferred until the interaction finishes, preventing asynchronous geometry metadata from interrupting a drag.
+- This is a source-only correction. Existing 0.52.0/0.52.0.1 users do not need to rerun setup.
+
+## 0.52.0.1 — Wheel-Compatible Automatic Charts Setup
+
+- Fixed Linux source setup on distributions whose default interpreter is Python 3.14. xatlas 0.0.11 does not publish a CPython 3.14 wheel, which caused pip to attempt a local C++ build and fail when Python development headers were absent.
+- `setup.sh` now prefers installed Python 3.11-3.13 interpreters and, when none is available, bootstraps a private managed Python 3.13 runtime through `uv`. The system Python is not replaced or modified.
+- Existing project `.venv` environments created with Python 3.14+ are detected and rebuilt automatically.
+- xatlas is installed binary-only so unsupported platforms fail clearly instead of entering a long, fragile source compilation.
+- Added matching source-setup guards and clearer diagnostics to the Windows scripts, runtime launchers and Automatic Charts error message.
+
+## 0.52.0 — Manual UV Unwrapping and 2D UV Preview
+
+- Added **Geometry UV Unwrap**, a manual-action geometry node with **Automatic Charts**, Box, Planar, Cylindrical and Spherical projection modes. Automatic Charts uses the compiled `xatlas` charting and atlas-packing backend; projection modes remain available as deterministic dependency-free alternatives.
+- Added a reusable manual execution contract for expensive nodes. Settings can be adjusted without starting work; the Inspector presents **Unwrap**, **Re-Unwrap**, **Unwrap Again** and **Cancel** actions plus Not Run, Running, Up to Date, Out of Date, Cancelled and Failed states.
+- Manual operations evaluate an immutable snapshot on the background geometry worker, publish results transactionally, keep the previous successful output while a new request runs, and reject cancelled or obsolete presentation work. Editing relevant settings during a run marks the completed snapshot Out of Date rather than silently restarting it.
+- Persisted the last successful UV result, the geometry/settings signature used to produce it, chart IDs and UV diagnostics in the graph. Reopening a project immediately restores the completed geometry and UV display without recalculating. Failed or cancelled attempts never replace the last valid result.
+- Added a preview-only **Preview Texture** image input. Changing or reconnecting that texture refreshes only the 2D presentation and never invalidates the stored unwrap.
+- Added a dedicated 2D UV presentation mode with checker background, triangle wires, island tinting, seam highlighting and overlap highlighting. Focusing Geometry UV Unwrap shows its mesh in 3D and atlas in 2D simultaneously; Geometry UV Transform also gains the shared UV presentation automatically.
+- Added UV diagnostics for backend, chart/island count, packed atlas dimensions, estimated atlas coverage, overlap triangles, zero-area UV triangles and out-of-bounds UV vertices. Overlap masks remain available after save/load rather than being reduced to text metadata.
+- Added native `xatlas` setup, startup diagnostics, Windows PyInstaller collection and package-smoke validation. Existing source-test environments must run `setup.sh` or `setup.bat` once after updating to 0.52.0.
+- Advanced the graph format from **19 to 20** to identify graphs that may carry persistent manual-operation results. Existing graphs migrate automatically. The built-in registry now contains **184 node types**.
+
+## 0.51.3.5 — Iterative Watertight Decimation
+
+- Fixed Geometry Decimate stopping far above its requested Percentage after the first native collapse ordering encountered a topology-breaking state. The previous 0.51.3.4 protection correctly avoided cracks, but treated one collapse sequence as the mesh's absolute reduction limit.
+- Geometry Decimate now accepts the nearest watertight intermediate result and builds a fresh native QEM collapse plan from that mesh, repeating as needed while preserving the original absolute triangle target. One node can therefore perform the useful work previously achievable only by chaining many Decimate nodes.
+- Deep reductions receive a bounded number of native re-planning passes derived from the requested reduction ratio, with a hard sixteen-pass ceiling, cancellation checkpoints, monotonic progress reporting and no-progress detection. The node never compounds the Percentage between passes.
+- The Inspector reports iterative topology protection and its pass count. When the requested target is reached it explains that fresh collapse orderings were used; when a mesh still cannot progress safely it reports the genuine remaining limitation instead of implying the first collapse prefix was final.
+- Preserved crack checks, exact-position seam welding, UV/hard-normal reconstruction, native collapse caching and the Python compatibility fallback for genuine native-backend failures.
+- This is a source-only correction; users who already installed the 0.51.3 native dependency do not need to run setup again.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.3.4 — Watertight Native Decimation Backoff
+
+- Fixed Geometry Decimate abandoning the native QEM path whenever one requested collapse prefix opened an otherwise closed manifold mesh. The node now retreats along the already-cached native collapse sequence and selects the nearest earlier watertight state instead of rerunning the much slower Python compatibility reducer.
+- Closed-mesh validation now runs directly on the welded geometric triangle buffer before UV and hard-normal seams are reconstructed, making the safety check cheaper and explicitly about real cracks rather than render-vertex splits.
+- Added a bounded exponential/binary backoff search with cancellation and progress reporting. When topology protection must stop above the requested percentage, the Inspector reports **Native QEM (topology-protected)** and explains why the output triangle count is higher than the target.
+- Retained the Python fallback only for genuinely unavailable native dependencies, unrecoverable third-party failures, or attribute reconstruction that cannot remain watertight.
+- This is a source-only correction; users who already installed the 0.51.3 native dependency do not need to run setup again.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.3.3 — Startup Import-Cycle Fix
+
+- Fixed the application failing during `run.sh` / `run.bat` startup with `ImportError: cannot import name 'AngleDial' from partially initialized module 'vfx_texture_lab.ui.parameters'`.
+- Moved the shared dense-wireframe triangle limit into a dependency-neutral `geometry_limits` module. The Parameters panel and 3D settings now consume the same value without the UI importing the `three_d` package during its own initialization.
+- Preserved the 250,000-triangle Auto Wireframe threshold, Geometry Statistics messaging, renderer behaviour and all 0.51.3.2 functionality.
+- This is a source-only correction; users who already installed the 0.51.3 dependency do not need to run setup again.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.3.2 — Dense Geometry Statistics
+
+- Added a shared Geometry Statistics inspector section for generated and processed geometry nodes, including exact input/output vertex and triangle counts, mesh memory and topology-change ratio.
+- Geometry Subdivide now makes dense results explicit even when the preview wireframe is no longer practical to draw.
+- Auto wireframe remains intentionally suppressed above 250,000 triangles; the Inspector and 3D preview summary now explain the threshold and how to force the overlay with Wireframe: Always.
+- Centralised the Auto wireframe triangle threshold so renderer and Inspector messaging cannot drift apart.
+
+## 0.51.3.1 — Native Decimation Replay Fix
+
+- Fixed Geometry Decimate falling back to the Python compatibility reducer even when `fast-simplification` was installed correctly. The native package uses float64 positions for its initial simplification entry point but float32 positions for collapse replay; the cached welded topology was being passed to replay as float64, producing the misleading `Buffer dtype mismatch, expected 'float' but got 'double'` warning.
+- Added explicit native-boundary conversions: simplification now receives contiguous float64 positions and int32 triangles, while replay receives contiguous float32 positions, int32 triangles and int32 collapse pairs. Cached collapse histories are also stored as int32, reducing their memory footprint.
+- Replaced the installation-only fallback message with a diagnostic that distinguishes a genuinely missing package from any other native-backend failure. Existing 0.51.3 environments do not need the dependency reinstalled for this fix; overwriting the source is sufficient.
+- Added dtype-strict regression coverage matching the two compiled Cython entry points so an installed-but-fallback failure cannot silently return.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.3 — High-Poly Geometry Foundations
+
+- Replaced the interactive Geometry Decimate path with the compiled **fast-simplification** quadric-error backend. The native extension is installed by both setup scripts and explicitly collected by the Windows PyInstaller build; the existing NumPy implementation remains as a compatibility fallback with a visible warning when an older environment has not been updated.
+- Rebuilt simplification around an exact-position welded geometric topology. OBJ UV seams and hard-normal splits no longer behave as unrelated boundaries that can drift apart: they are simplified once as shared positions, then reconstructed as coincident render vertices carrying their original UV and hard-normal groups. Closed manifold input is validated after reduction and any result that would tear it open is rejected.
+- Lowered native simplification aggression for a quality-first result while retaining the requested Percentage target where the backend can reach it. Output normals are rebuilt area-weighted, UV islands are restored, degenerate and duplicate geometric triangles are removed before simplification, and output topology is diagnosed before publication.
+- Added reusable native collapse-sequence caching. Nearby Percentage edits replay a prefix of the existing collapse history instead of re-running QEM from the high-poly source. A superseded native calculation is still allowed to publish its valid collapse plan into the cache so the newest queued value can reuse the work.
+- Moved focused Geometry evaluation off the Qt UI thread. Slow Mesh Input, Geometry Decimate and other future heavy geometry nodes now show the established orange animated wires, Evaluation Inspector progress and 3D status text while the interface remains responsive.
+- Added latest-request-wins geometry scheduling: slider edits are debounced, obsolete results are rejected, queued geometry work uses one dedicated worker lane, cooperative Python stages cancel at bounded checkpoints, and releasing the control resolves only the newest authored value.
+- Reworked OBJ loading as a streaming importer backed by compact numeric arrays. It no longer decodes and retains the complete file plus a second Python corner representation, parses linked and embedded OBJ sources with progress/cancellation, generates missing smooth normals in vectorised batches, and caches parsed GeometryData within a bounded memory budget.
+- Deferred synchronous metadata scanning for OBJ files above 32 MiB. Large Mesh Input nodes appear immediately and calculate full source information on the background geometry worker when previewed.
+- Added central mesh diagnostics for unique geometric positions, boundary and non-manifold edges, degenerate and duplicate triangles, connected components, UV seam vertices, hard-normal seam vertices, closed-manifold status and loaded memory. Mesh Input and Geometry Decimate now expose these details in the Parameters panel.
+- Added `tools/geometry_stress.py` for repeatable million-triangle generation, OBJ round-trip import, diagnostics, renderer-buffer preparation and optional native decimation measurements. The included development run successfully round-tripped a 1,000,000-triangle, 60.4 MB OBJ into a 28.0 MB indexed mesh; import plus topology diagnostics completed without exceeding the five-million-triangle safety cap.
+- Confirmed the existing high-poly viewport safeguards remain active: geometry uses contiguous float32/uint32 renderer buffers and automatic wireframe generation is suppressed above 250,000 triangles unless explicitly forced.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.2.1 — High-Poly Reduction Fixes
+
+- Reworked Geometry Decimate's collapse validation so every affected face is checked in one vectorised batch and whole-mesh bounds are calculated once per simplification pass instead of once per candidate edge. This removes the dominant high-poly bottleneck while retaining manifold link checks, boundary protection, flip rejection and exact target trimming.
+- Reduced a synthetic 32,768-triangle 50% decimation from roughly nine seconds to roughly one second in the development environment. Actual timings depend on topology, UV seams and hardware, but imported meshes in this size range should no longer take tens of seconds per Percentage change.
+- Extended Geometry Un-Subdivide to recognise regular triangulated UV lattices produced by Geometry Plane, Geometry Box and Geometry Ribbon, including position-only deformation. Alternate rows and columns are removed per iteration while preserving UVs, normals, winding and non-degenerate triangles.
+- Preserved exact Geometry Subdivide reversal as a distinct lineage. Once the authored pre-subdivision mesh is reached, extra iterations stop instead of unexpectedly applying the UV-grid reducer to that source mesh.
+- Clarified that arbitrary imported rocks, scans and triangle meshes cannot be truly un-subdivided because they do not retain an earlier control cage. Geometry Un-Subdivide now directs those meshes to Geometry Decimate rather than implying that every triangulated asset is reversible.
+- Added focused regressions for structured Box and Ribbon reduction, scan guidance, exact Subdivide exhaustion and the existing topology-safety guarantees.
+- Graph format remains **19** and the built-in registry remains at **183 node types**.
+
+## 0.51.2 — Geometry Reduction
+
+- Added **Geometry Decimate** with a floating-point **Percentage** control from 1% to 100%, defaulting to 100%. The percentage targets retained input triangles rather than vertices, while always keeping at least one visible triangle where the protected topology permits.
+- Implemented constrained quadric-error edge collapse with edge-segment replacement positions, manifold link checks, triangle-flip rejection, geometric-degeneracy cleanup and duplicate-face removal. Batch trimming prevents a simplification step from jumping below the requested target.
+- Preserved open silhouettes, UV islands and hard-normal splits through boundary quadrics and the existing seam-split indexed representation. UVs and stored normals interpolate across accepted collapses; meshes whose protected boundaries prevent an extreme target stop at the closest safe count above it.
+- Added a separate **Geometry Un-Subdivide** node with one to six Iterations. One iteration removes one compatible midpoint-subdivision level, exactly reversing the stable four-triangle topology emitted by Geometry Subdivide; extra iterations stop automatically when no earlier recoverable level remains.
+- Kept Un-Subdivide iteration-based rather than presenting a misleading percentage. Applied subdivision levels are discrete, and arbitrary triangulation cannot always reveal the pre-subdivision control mesh. Compatible topology is reconstructed; incompatible meshes report a clear evaluation error rather than guessing.
+- Added focused pure-Python regressions for registry controls, percentage limits, unchanged 100% output, target overshoot protection, non-degenerate results, one-triangle safety, exact two-level Subdivide reversal and smoothed-topology reversal.
+- Graph format remains **19**. Existing graphs load unchanged, and the built-in registry now contains **183 node types**.
+
+## 0.51.1 — Resource and Mesh Drag-and-Drop
+
+- Added drag-and-drop creation from **Graph Explorer** resources. Dragging an image resource onto a canvas creates an Image Input; dragging a mesh resource creates a Mesh Input that shares the graph-owned resource.
+- Made cross-graph resource drops safe and deliberate. Dropping a resource onto a different open graph copies the resource record into the destination graph, resolves linked paths against the source graph, preserves embedded bytes and metadata, recreates its virtual folder hierarchy, and then creates the matching input node.
+- Repeated cross-graph drops reuse the equivalent copied resource rather than multiplying duplicate resource records. Source and destination graphs never share a resource ID, so later relinking, embedding, renaming or organising one graph cannot contaminate the other.
+- Added direct Wavefront **OBJ drag-and-drop from the operating-system file manager** onto the graph canvas, matching the established image-drop workflow and automatically creating a Mesh Input.
+- Updated Graph Explorer guidance, resource-library helpers and regression coverage for copied folder hierarchies, linked-path resolution, embedded payload preservation, independent metadata and duplicate reuse.
+- Graph format remains **19**; existing 0.51.0 graphs load unchanged.
+
+## 0.51.0 — Mesh Input and Graph Resources
+
+- Added **Mesh Input**, importing Wavefront OBJ files as typed Geometry. The importer preserves authored positions, UV seams and hard-normal splits, triangulates polygon faces, supports positive and negative OBJ indices, normalises authored normals, and generates area-weighted smooth normals when they are absent.
+- Added linked and embedded OBJ handling equivalent to Image Input, including source metadata, reload/relink actions, embedded recovery bytes, restoration to disk, self-contained graph export and exact source-file preservation inside `.vfxpackage` archives.
+- Introduced a graph-level **resource library** with stable resource IDs for imported images and meshes. Multiple nodes using the same source share one resource record, while changing one shared node to a different source safely creates or reuses the appropriate record instead of silently replacing every use.
+- Expanded **Graph Explorer** so each open graph is the parent of its imported image and mesh resources. Resources report linked, embedded and missing states, usage counts and source paths, and can select their using nodes, relink/replace, embed, restore, reveal, rename, move or be removed when unused.
+- Added nested virtual resource folders stored inside the graph. Folders organise images and meshes without moving files on disk; removing a folder reparents its contents rather than deleting source files.
+- Added transparent migration for existing **Image Input** nodes. Opening or saving an older graph creates graph resource records while retaining the established Image Input parameters and evaluation behaviour. Embedded payloads are stored once in format 19 and hydrated for normal graphs, duplicated sessions and nested Graph Instance evaluation.
+- Updated portable graph recovery, Inspector summaries and VFX package validation to count and validate imported meshes alongside images.
+- Added focused pure-Python regression coverage for OBJ triangulation, negative indices, UV seams, authored/generated normals, resource deduplication and migration, folder operations, linked/embedded restoration, self-contained export and packaged mesh-source integrity.
+- Graph format advances from **18 to 19** to store the graph resource library and virtual folder hierarchy. Existing graphs migrate automatically when loaded.
+
+## 0.50.2.1 — Complete Long Fur Strands
+
+- Fixed long **Fur** strokes disappearing at internal procedural-cell boundaries when Length was raised beyond the old neighbourhood range. The resulting horizontal cut-offs could remove a strand while its height profile was still bright.
+- Fur now calculates an angle-aware search neighbourhood from Length, Width, Softness, base Angle and Angle Random, expanding along the directions a strand can actually occupy. Long hairs therefore remain present until their rounded longitudinal dome reaches true black at both ends.
+- Kept the common aligned-hair case efficient by expanding the search anisotropically instead of brute-forcing the full maximum square. Fibres and Messy Fibres retain their historical neighbourhood and behaviour.
+- Added regression coverage for vertical, horizontal, fully random and maximum-width Fur search bounds, plus the corresponding CPU/WGSL implementation contract.
+- Graph format remains version 18; existing 0.50.2 graphs load unchanged.
+
+## 0.50.2 — Fur Profiles and Linear Gradients
+
+- Replaced Fur's mirrored-linear longitudinal strand height with a rounded parabolic dome on both the primary hairs and undercoat. The strand midpoint now has a smooth crest instead of a sharp derivative cusp that could read as a crease after normal generation or displacement. CPU and WGSL paths use the same profile.
+- Increased Fur **Density** from a maximum of 3 to **10** and Fur **Length** from a maximum of 3 to **5**. Fibres and Messy Fibres retain their existing limits, while the shared CPU/GPU strand evaluator now accepts the larger Fur density.
+- Added **Linear Gradient 2**, a smooth cosine-shaped black-to-white-to-black directional gradient with Angle, Offset and Repeat controls.
+- Added **Linear Gradient 3**, a mirrored linear black-to-white-to-black directional gradient with an intentionally sharp white centre ridge and the same controls.
+- Added focused regressions for Fur control limits, rounded crest implementation, gradient profiles, registry/backend wiring and optional CPU/GPU agreement.
+- Graph format remains version 18; existing 0.50.1 graphs load unchanged.
+
 ## 0.50.1 — Windows Distribution and Colour Accuracy
 
 - Fixed the **Colour** generator treating display-sRGB picker values as if they were already linear-light graph data. CPU and GPU evaluation now convert RGB exactly once while preserving alpha, so the 2D preview and exported sRGB colour match the selected hex value.

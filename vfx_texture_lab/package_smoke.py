@@ -81,6 +81,144 @@ def run_package_smoke_test(*, require_frozen: bool = False) -> SmokeReport:
     _check_import("wgpu", checks, errors)
     _check_import("wgpu.backends.auto", checks, errors)
     _check_import("wgpu.backends.wgpu_native", checks, errors)
+    fast_simplification_module = _check_import("fast_simplification", checks, errors)
+    xatlas_module = _check_import("xatlas", checks, errors)
+    trimesh_module = _check_import("trimesh", checks, errors)
+    embreex_module = _check_import("embreex", checks, errors)
+    _check_import("scipy.ndimage", checks, errors)
+    _check_import("scipy.sparse.csgraph", checks, errors)
+    skimage_measure_module = _check_import("skimage.measure", checks, errors)
+    if xatlas_module is not None:
+        if not hasattr(xatlas_module, "Atlas") or not hasattr(xatlas_module, "ChartOptions"):
+            errors.append("Native xatlas bindings do not expose the expected Atlas API")
+        elif numpy_module is not None:
+            try:
+                atlas = xatlas_module.Atlas()
+                points = numpy_module.asarray(
+                    ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 1.0), (0.0, 0.0, 1.0)),
+                    dtype=numpy_module.float32,
+                )
+                faces = numpy_module.asarray(
+                    ((0, 1, 2), (0, 2, 3)), dtype=numpy_module.uint32
+                )
+                atlas.add_mesh(points, faces)
+                atlas.generate()
+                mapping, output_faces, uvs = atlas[0]
+                atlas_ids, chart_ids = atlas.get_mesh_vertex_assignment(0)
+                if (
+                    len(mapping) < 4
+                    or len(output_faces) != 2
+                    or len(uvs) != len(mapping)
+                    or len(atlas_ids) != len(mapping)
+                    or len(chart_ids) != len(mapping)
+                ):
+                    raise ValueError("native xatlas returned incomplete smoke-test data")
+                checks.append("Executed native xatlas UV charting and assignment API")
+            except Exception as exc:
+                errors.append(f"Native xatlas: {type(exc).__name__}: {exc}")
+    if embreex_module is not None and trimesh_module is not None and numpy_module is not None:
+        try:
+            from trimesh.ray.ray_pyembree import RayMeshIntersector
+            mesh = trimesh_module.Trimesh(
+                vertices=numpy_module.asarray(((-1.0, -1.0, 0.0), (1.0, -1.0, 0.0), (0.0, 1.0, 0.0))),
+                faces=numpy_module.asarray(((0, 1, 2),)),
+                process=False,
+            )
+            intersector = RayMeshIntersector(mesh)
+            hit = intersector.intersects_any(
+                numpy_module.asarray(((0.0, 0.0, 1.0),)),
+                numpy_module.asarray(((0.0, 0.0, -1.0),)),
+            )
+            if not bool(hit[0]):
+                raise ValueError("Embree ray missed the smoke-test triangle")
+            checks.append("Executed the native Embree high-to-low projection backend")
+
+            from .geometry import GeometryData, plane_geometry
+            from .geometry_bake import _perform_bake
+            low = plane_geometry(1.0, 1.0, 1, 1, "Vertical (XY)", name="Bake Low")
+            high_base = plane_geometry(1.0, 1.0, 1, 1, "Vertical (XY)", name="Bake High")
+            high_vertices = high_base.vertices.copy()
+            high_vertices[:, 2] += 0.05
+            high = GeometryData(high_vertices, high_base.indices.copy(), "Bake High")
+            source_colour = numpy_module.ones((8, 8, 4), dtype=numpy_module.float32)
+            source_colour[..., 0] = 0.25
+            baked = _perform_bake(
+                high, low, source_colour, None,
+                {
+                    "resolution": 64,
+                    "supersampling": "1x",
+                    "padding": 2,
+                    "bake_albedo": True,
+                    "bake_normal": True,
+                    "bake_height": True,
+                    "bake_ambient_occlusion": False,
+                    "projection_mode": "Outward Only",
+                    "distance_mode": "Manual",
+                    "front_distance": 0.2,
+                    "back_distance": 0.2,
+                    "ray_bias_percent": 0.001,
+                    "height_range": "Automatic Symmetric",
+                    "normal_y": "OpenGL (+Y)",
+                    "albedo_filter": "Bilinear",
+                    "preserve_alpha": True,
+                    "name": "Bake Smoke",
+                },
+                None,
+            )
+            if baked.diagnostics.get("hit_percent", 0.0) < 99.0:
+                raise ValueError("high-to-low bake smoke test had projection misses")
+            if not {"Albedo", "Normal", "Height", "Projection Mask"}.issubset(baked.maps):
+                raise ValueError("high-to-low bake smoke test did not publish all requested maps")
+            checks.append("Completed a native high-to-low map bake")
+        except Exception as exc:
+            errors.append(f"Embree bake backend: {type(exc).__name__}: {exc}")
+
+    if (
+        trimesh_module is not None
+        and skimage_measure_module is not None
+        and numpy_module is not None
+    ):
+        try:
+            from .geometry import GeometryEvalContext, box_geometry
+            from .mesh_remesh import voxel_remesh
+
+            source = box_geometry(1.0, 1.0, 1.0, 1, 1, 1, name="Smoke Box")
+            result = voxel_remesh(
+                source,
+                {
+                    "name": "Smoke Remesh",
+                    "voxel_size_mode": "Relative to Bounds",
+                    "relative_voxel_size": 25.0,
+                    "fill_interior": True,
+                    "surface_smoothing": 0.25,
+                    "preserve_volume": True,
+                    "adaptivity": 0.0,
+                },
+                GeometryEvalContext(),
+            )
+            if result.geometry.triangle_count < 4:
+                raise ValueError("voxel remesh returned an empty smoke-test mesh")
+            if not bool(result.diagnostics.get("output_closed_manifold", False)):
+                raise ValueError("voxel remesh smoke-test output was not closed")
+            checks.append("Executed Geometry Remesh native dependency stack")
+        except Exception as exc:
+            errors.append(f"Geometry Remesh: {type(exc).__name__}: {exc}")
+
+    if fast_simplification_module is not None and numpy_module is not None:
+        try:
+            points = numpy_module.asarray(
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)),
+                dtype=numpy_module.float64,
+            )
+            faces = numpy_module.asarray(((0, 1, 2), (0, 2, 3)), dtype=numpy_module.int64)
+            out_points, out_faces = fast_simplification_module.simplify(
+                points, faces, target_count=1, agg=3.0
+            )
+            if len(out_points) < 3 or len(out_faces) < 1:
+                raise ValueError("native simplifier returned an empty smoke-test mesh")
+            checks.append("Executed native high-poly simplification extension")
+        except Exception as exc:
+            errors.append(f"Native simplification: {type(exc).__name__}: {exc}")
 
     shader_files: list = []
     try:

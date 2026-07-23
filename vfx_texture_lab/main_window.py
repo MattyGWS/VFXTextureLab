@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .custom_nodes import CustomNodePackageManager
 from .document import DocumentSettings, GraphAssetMetadata
+from .graph_resources import GraphResourceLibrary, migrate_project_resources
 from .engine import AsyncEvaluationController, GraphEvaluator, GraphSnapshot
 from .engine.evaluator import _prepare_cpu_preview_rgba8
 from .engine.cache import MemoryLRU
@@ -42,6 +43,7 @@ from .nodes.base import EvalContext, is_image_kind, normalise_port_kind
 from .material_graph import MATERIAL_PRODUCER_TYPES
 from .geometry import export_obj
 from .geometry_graph import GeometryEvaluationSession, material_geometry_reference
+from .geometry_evaluation import GeometryEvaluationController
 from .graph_asset_thumbnails import encode_thumbnail_image
 from .graph_asset_library import default_graph_asset_directory
 from .graph_assets import (
@@ -71,7 +73,9 @@ from .ui import (
     CustomNodeLibrariesDialog,
     EvaluationInspector,
     ExportTemplateLibraryDialog,
+    ExplorerFolderInfo,
     ExplorerGraphInfo,
+    ExplorerResourceInfo,
     GraphExplorer,
     NodeLibrary,
     NodePreferences,
@@ -127,6 +131,7 @@ class GraphDocumentSession:
     display_name: str = "Untitled.vfxgraph"
     graph_asset: GraphAssetMetadata = field(default_factory=GraphAssetMetadata)
     export_profiles: ExportProfileLibrary = field(default_factory=ExportProfileLibrary.default)
+    graph_resources: GraphResourceLibrary = field(default_factory=GraphResourceLibrary)
 
     @property
     def dirty(self) -> bool:
@@ -175,6 +180,7 @@ class MainWindow(QMainWindow):
         self.document = DocumentSettings()
         self.graph_asset = GraphAssetMetadata(created_with=__version__)
         self.export_profiles = ExportProfileLibrary.default()
+        self.graph_resources = GraphResourceLibrary()
         self.package_manager = CustomNodePackageManager(self.settings, self)
         self.registry = build_registry()
         self.preferences = NodePreferences(self)
@@ -192,6 +198,7 @@ class MainWindow(QMainWindow):
         )
         self._reload_custom_nodes(initial=True)
         self.eval_controller = AsyncEvaluationController(self.evaluator, self)
+        self.geometry_controller = GeometryEvaluationController(self)
         # Optional node thumbnails use a dedicated lowest-priority controller.
         # With no expanded thumbnails this controller never submits work.
         self.thumbnail_controller = AsyncEvaluationController(self.evaluator, self)
@@ -233,6 +240,11 @@ class MainWindow(QMainWindow):
         self._geometry_result_cache: MemoryLRU[CachedGeometryMesh] = MemoryLRU(
             max(gpu_budget_mb // 2, 256) * 1024 * 1024
         )
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_node_uid: str | None = None
+        self._pending_geometry_request: dict | None = None
+        self._geometry_node_activity: dict[str, str] = {}
+        self._geometry_preview_debounce_ms = 160
         self._material_preview_metadata: OrderedDict[str, MaterialEvaluationResult] = OrderedDict()
         self._material_preview_metadata_limit = 64
         self.preview_3d_panel.set_material_cache_budget_mb(gpu_budget_mb)
@@ -389,6 +401,14 @@ class MainWindow(QMainWindow):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.preview_timer.timeout.connect(self._dispatch_pending_preview)
+
+        # Expensive geometry edits are evaluated off the UI thread. A short
+        # latest-value debounce prevents slider drags from launching a native
+        # simplification for every intermediate percentage.
+        self.geometry_preview_timer = QTimer(self)
+        self.geometry_preview_timer.setSingleShot(True)
+        self.geometry_preview_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.geometry_preview_timer.timeout.connect(self._dispatch_pending_geometry_preview)
 
         # The material preview is intentionally capped lower than the 2D view
         # so it remains responsive without stealing all resources from direct
@@ -1252,6 +1272,7 @@ class MainWindow(QMainWindow):
         self.graph_view.backgroundClicked.connect(self._inspect_active_graph)
         self.graph_view.inspectorItemClicked.connect(self._selected_item_changed)
         self.graph_view.openGraphInstanceRequested.connect(self._insert_open_graph_instance)
+        self.graph_view.graphResourceDropRequested.connect(self._insert_graph_resource)
         self.graph_view.set_open_graph_drop_validator(self._can_insert_open_graph_instance)
         self.graph_explorer.newRequested.connect(self.new_project)
         self.graph_explorer.openRequested.connect(self.open_project)
@@ -1267,6 +1288,17 @@ class MainWindow(QMainWindow):
         self.graph_explorer.revealRequested.connect(self._reveal_graph_session)
         self.graph_explorer.reloadRequested.connect(self._reload_graph_session)
         self.graph_explorer.addToLibraryRequested.connect(self._add_graph_session_to_library)
+        self.graph_explorer.addFolderRequested.connect(self._explorer_add_resource_folder)
+        self.graph_explorer.renameFolderRequested.connect(self._explorer_rename_resource_folder)
+        self.graph_explorer.removeFolderRequested.connect(self._explorer_remove_resource_folder)
+        self.graph_explorer.resourceSelectedRequested.connect(self._explorer_select_resource)
+        self.graph_explorer.resourceRelinkRequested.connect(self._explorer_relink_resource)
+        self.graph_explorer.resourceEmbedRequested.connect(self._explorer_embed_resource)
+        self.graph_explorer.resourceRestoreRequested.connect(self._explorer_restore_resource)
+        self.graph_explorer.resourceRevealRequested.connect(self._explorer_reveal_resource)
+        self.graph_explorer.resourceRenameRequested.connect(self._explorer_rename_resource)
+        self.graph_explorer.resourceMoveRequested.connect(self._explorer_move_resource)
+        self.graph_explorer.resourceRemoveRequested.connect(self._explorer_remove_resource)
         self.library_panel.reloadCustomNodesRequested.connect(self._reload_custom_nodes)
         self.package_manager.sourceFilesChanged.connect(self._custom_node_files_changed)
         self.preview_panel.exportRequested.connect(self.export_active_image)
@@ -1279,6 +1311,9 @@ class MainWindow(QMainWindow):
         self.parameters_panel.textureSetQuickExportRequested.connect(self._texture_set_quick_export)
         self.parameters_panel.geometryExportRequested.connect(self._geometry_export)
         self.parameters_panel.exportTemplateEditRequested.connect(self._edit_export_template)
+        self.parameters_panel.manualActionRequested.connect(self._run_manual_node_action)
+        self.parameters_panel.manualActionCancelRequested.connect(self._cancel_manual_node_action)
+        self.preview_panel.uvOptionsChanged.connect(self._uv_preview_options_changed)
         self.parameters_panel.interactiveEditStarted.connect(self._parameter_interaction_started)
         self.parameters_panel.interactiveEditFinished.connect(self._parameter_interaction_finished)
         self.parameters_panel.histogramActivityChanged.connect(
@@ -1289,6 +1324,11 @@ class MainWindow(QMainWindow):
         self.eval_controller.evaluationFailed.connect(self._preview_failed)
         self.eval_controller.evaluationProgress.connect(self._preview_progress)
         self.eval_controller.evaluationNodeState.connect(self._preview_node_state)
+        self.geometry_controller.resultReady.connect(self._geometry_preview_ready)
+        self.geometry_controller.evaluationStarted.connect(self._geometry_preview_started)
+        self.geometry_controller.evaluationFailed.connect(self._geometry_preview_failed)
+        self.geometry_controller.evaluationProgress.connect(self._geometry_preview_progress)
+        self.geometry_controller.evaluationNodeState.connect(self._geometry_node_state)
         self.thumbnail_controller.resultReady.connect(self._thumbnail_ready)
         self.thumbnail_controller.evaluationFailed.connect(self._thumbnail_failed)
         self.graph_view.viewportChanged.connect(self._schedule_thumbnail_refresh)
@@ -1339,6 +1379,7 @@ class MainWindow(QMainWindow):
                 data.get("graph_asset"), default_name="Untitled Graph", created_with=__version__
             )
             self.export_profiles = ExportProfileLibrary.from_dict(data.get("export_profiles"))
+            self.graph_resources = GraphResourceLibrary.from_dict(data.get("resources"))
             self.graph_asset.regenerate_identity()
             self.current_frame = 0
             self.scene.default_tiling = self.document.default_tiling
@@ -1539,19 +1580,47 @@ class MainWindow(QMainWindow):
         self._update_dirty_state()
 
     def _graph_changed(self) -> None:
+        change_hint = (
+            self.scene.consume_graph_change_hint()
+            if hasattr(self.scene, "consume_graph_change_hint")
+            else None
+        )
         self._invalidate_flipbook_decode_cache()
         self._sync_preview_gizmo(getattr(self.scene, "active_node", None))
-        # Geometry focus is also demand-driven, but mesh evaluation is tiny and
-        # resolution-independent. Rebuild it immediately instead of submitting
-        # an image job that cannot represent geometry.
+        # Geometry previews run on their own cancellable worker. Rapid graph
+        # edits are collapsed into the newest mesh request instead of blocking
+        # Qt or queuing every intermediate slider value.
         active_node = self.scene.active_node
         if self._is_geometry_preview_node(active_node):
+            # Editing settings on a completed manual node does not change the
+            # currently published mesh. In particular, Best Packing used to
+            # schedule a needless persisted-result decode/UV presentation pass
+            # on the UI cadence, causing a visible hitch for dense unwraps.
+            # Keep the existing 2D/3D result untouched until the action button
+            # is pressed; the Inspector updates its Out of Date state in place.
+            if (
+                change_hint is not None
+                and change_hint == ("manual-settings-only", str(active_node.uid))
+            ):
+                self._schedule_autosave()
+                return
+            # Manual-action nodes deliberately keep executing from the snapshot
+            # captured when their Inspector button was pressed. Edits made while
+            # they run only mark the eventual result stale; they must not cancel
+            # and restart the expensive operation automatically.
+            if (
+                active_node.definition.manual_action_label
+                and str(active_node.parameters.get("_manual_status", "")) == "Running"
+            ):
+                self._schedule_thumbnail_refresh()
+                self._schedule_autosave()
+                return
             self.material_controller.cancel()
             self._material_preview_in_flight = False
             self._material_preview_pending = False
             self._pending_material_request_key = None
             self._clear_material_node_activity()
-            self._show_geometry_node(active_node)
+            self._schedule_geometry_preview(active_node)
             self._schedule_thumbnail_refresh()
             self._schedule_autosave()
             return
@@ -1587,6 +1656,22 @@ class MainWindow(QMainWindow):
         self._schedule_autosave()
 
     def _active_node_changed(self, node) -> None:
+        pending = getattr(self, "_pending_geometry_request", None) or {}
+        pending_uid = str(pending.get("node_uid", "") or "")
+        new_uid = str(getattr(node, "uid", "") or "")
+        if pending_uid and pending_uid != new_uid:
+            previous = self.scene.nodes.get(pending_uid)
+            if (
+                previous is not None
+                and previous.definition.manual_action_label
+                and str(previous.parameters.get("_manual_status", "")) == "Running"
+            ):
+                requested = int(previous.parameters.get("_manual_run_serial", 0) or 0)
+                previous.parameters["_manual_completed_serial"] = requested
+                previous.parameters["_manual_status"] = "Cancelled"
+                previous.parameters["_manual_changed_during_run"] = False
+                previous.parameters["_manual_last_error"] = ""
+                self._mark_document_dirty()
         self._invalidate_flipbook_decode_cache()
         self._sync_preview_gizmo(node)
         focused_material = self._resolve_material_node(node) if self._is_material_preview_node(node) else None
@@ -1628,12 +1713,20 @@ class MainWindow(QMainWindow):
             self.preview_3d_panel.set_active_output(
                 True, str(node.parameters.get("name", node.definition.name))
             )
-            self._show_geometry_node(node)
+            self._schedule_geometry_preview(node, immediate=True)
             return
 
         # Leaving a geometry focus restores the project's ordinary preview mesh.
         # Material focus may immediately replace it again from its optional
         # Geometry input below.
+        if hasattr(self, "geometry_preview_timer"):
+            self.geometry_preview_timer.stop()
+        if hasattr(self, "geometry_controller"):
+            self.geometry_controller.cancel()
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_request = None
+        self._pending_geometry_node_uid = None
+        self._clear_geometry_node_activity()
         self.preview_3d_panel.clear_geometry_override()
 
         cached_decode_playback = False
@@ -1790,15 +1883,24 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _mesh_from_geometry(geometry, *, cache_key: str = "") -> MeshData:
-        return MeshData(geometry.vertices, geometry.indices, geometry.name, cache_key)
+        mesh_cache_key = (
+            f"{cache_key}:uv={geometry.uv_origin}"
+            if cache_key
+            else f"uv={geometry.uv_origin}"
+        )
+        return MeshData(
+            geometry.vertices, geometry.indices, geometry.name, mesh_cache_key,
+            uv_origin=geometry.uv_origin,
+        )
 
     @staticmethod
     def _snapshot_geometry_branch_dynamic(snapshot: GraphSnapshot, source_uid: str) -> bool:
-        """Return whether a geometry branch can vary with timeline/state.
+        """Return whether geometry content can vary with timeline/state.
 
-        Geometry nodes themselves are ordinarily static, but Geometry Displace
-        may bridge to animated or stateful image branches. Static meshes should
-        use one persistent cache entry for every Material edit and playback frame.
+        Presentation-only inputs (for example the UV node's checker texture) are
+        deliberately excluded. They may refresh the 2D presentation, but they
+        must never make the mesh itself frame-dependent or invalidate its GPU
+        buffers.
         """
         visited: set[str] = set()
         stack = [str(source_uid)]
@@ -1816,7 +1918,10 @@ class MainWindow(QMainWindow):
                 or (node.definition.gpu_spec is not None and node.definition.gpu_spec.uses_time)
             ):
                 return True
+            presentation_inputs = set(node.definition.presentation_only_inputs)
             for input_name in node.input_names:
+                if input_name in presentation_inputs:
+                    continue
                 source = snapshot.inputs.get((uid, input_name))
                 if source is not None:
                     stack.append(str(source[0]))
@@ -1824,6 +1929,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _snapshot_geometry_branch_uses_images(snapshot: GraphSnapshot, source_uid: str) -> bool:
+        """Return whether image data changes the actual geometry content."""
         visited: set[str] = set()
         stack = [str(source_uid)]
         while stack:
@@ -1834,7 +1940,10 @@ class MainWindow(QMainWindow):
             node = snapshot.nodes.get(uid)
             if node is None:
                 continue
+            presentation_inputs = set(node.definition.presentation_only_inputs)
             for input_name in node.input_names:
+                if input_name in presentation_inputs:
+                    continue
                 source = snapshot.inputs.get((uid, input_name))
                 if source is None:
                     continue
@@ -1844,23 +1953,67 @@ class MainWindow(QMainWindow):
                 stack.append(str(source[0]))
         return False
 
-    def _geometry_cache_key(
-        self,
-        snapshot: GraphSnapshot,
+    def _geometry_content_revision(self, snapshot: GraphSnapshot, source_uid: str) -> str:
+        """Hash geometry content while excluding root presentation-only inputs."""
+        uid = str(source_uid)
+        node = snapshot.nodes.get(uid)
+        if node is None:
+            return self.evaluator.branch_revision(snapshot, uid)
+        content_inputs = {
+            key: value
+            for key, value in snapshot.inputs.items()
+            if not (
+                snapshot.nodes.get(str(key[0])) is not None
+                and str(key[1]) in snapshot.nodes[str(key[0])].definition.presentation_only_inputs
+            )
+        }
+        if len(content_inputs) == len(snapshot.inputs):
+            return self.evaluator.branch_revision(snapshot, uid)
+        return self.evaluator.branch_revision(GraphSnapshot(snapshot.nodes, content_inputs), uid)
+
+    def _geometry_presentation_revision(
+        self, snapshot: GraphSnapshot, source_uid: str
+    ) -> tuple[str | None, bool, bool]:
+        """Return revision/dynamic/present state for root presentation inputs."""
+        uid = str(source_uid)
+        node = snapshot.nodes.get(uid)
+        if node is None or not node.definition.presentation_only_inputs:
+            return None, False, False
+        entries: list[tuple[str, str, str, str]] = []
+        dynamic = False
+        for input_name in node.definition.presentation_only_inputs:
+            source = snapshot.inputs.get((uid, input_name))
+            if source is None:
+                continue
+            source_uid_value, source_output = str(source[0]), str(source[1])
+            entries.append((
+                str(input_name),
+                source_uid_value,
+                source_output,
+                self.evaluator.branch_revision(snapshot, source_uid_value),
+            ))
+            dynamic = dynamic or self._snapshot_geometry_branch_dynamic(snapshot, source_uid_value)
+        if not entries:
+            return None, False, False
+        encoded = json.dumps(entries, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=20).hexdigest(), dynamic, True
+
+    @staticmethod
+    def _geometry_mesh_cache_key(
+        *,
+        revision: str,
         source_uid: str,
         output_name: str,
         session: GeometryEvaluationSession,
-    ) -> tuple[str, str, bool]:
-        revision = self.evaluator.branch_revision(snapshot, source_uid)
-        dynamic = self._snapshot_geometry_branch_dynamic(snapshot, source_uid)
-        image_dependent = self._snapshot_geometry_branch_uses_images(snapshot, source_uid)
+        image_dependent: bool,
+        dynamic: bool,
+    ) -> str:
+        """Stable renderer identity for mesh content, independent of UV overlays."""
         animation = session.animation
         payload = {
-            "revision": revision,
+            "revision": str(revision),
             "source_uid": str(source_uid),
             "output": str(output_name or "Geometry"),
-            # Pure geometry is resolution/colour-space independent. Image-backed
-            # deformation keeps those context fields because sampling can change.
             "width": int(session.width) if image_dependent else None,
             "height": int(session.height) if image_dependent else None,
             "precision": str(session.precision) if image_dependent else None,
@@ -1872,8 +2025,101 @@ class MainWindow(QMainWindow):
             ),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return "geometry-mesh:" + hashlib.blake2b(encoded, digest_size=20).hexdigest()
+
+    def _geometry_cache_key(
+        self,
+        snapshot: GraphSnapshot,
+        source_uid: str,
+        output_name: str,
+        session: GeometryEvaluationSession,
+    ) -> tuple[str, str, bool, str, str]:
+        revision = self._geometry_content_revision(snapshot, source_uid)
+        content_dynamic = self._snapshot_geometry_branch_dynamic(snapshot, source_uid)
+        image_dependent = self._snapshot_geometry_branch_uses_images(snapshot, source_uid)
+        final = str(session.render_mode).startswith("final")
+        presentation_revision, presentation_dynamic, presentation_connected = (
+            (None, False, False)
+            if final
+            else self._geometry_presentation_revision(snapshot, source_uid)
+        )
+        dynamic = content_dynamic or presentation_dynamic
+        node = snapshot.nodes.get(str(source_uid))
+        manual_request = None
+        if node is not None and node.definition.manual_action_label:
+            requested = int(node.parameters.get("_manual_run_serial", 0) or 0)
+            completed = int(node.parameters.get("_manual_completed_serial", 0) or 0)
+            if requested > completed:
+                # Manual settings do not alter the published output revision,
+                # but a fresh request must bypass any cache holding the previous
+                # result so the action actually executes.
+                manual_request = (requested, completed)
+        uv_preview = bool(
+            not final
+            and node is not None
+            and node.definition.type_id.startswith("geometry.uv_")
+        )
+        bake_preview = bool(
+            not final
+            and node is not None
+            and node.definition.type_id == "geometry.bake_high_to_low"
+        )
+        selected_bake_map = (
+            str(node.parameters.get("preview_output", "Albedo")) if bake_preview else None
+        )
+        presentation_context = presentation_connected or uv_preview or bake_preview
+        animation = session.animation
+        payload = {
+            "revision": revision,
+            "manual_request": manual_request,
+            "presentation_revision": presentation_revision,
+            "source_uid": str(source_uid),
+            "output": str(output_name or "Geometry"),
+            # Pure geometry remains resolution/colour-space independent. Image-
+            # backed deformation and 2D UV presentation retain the fields they
+            # genuinely use.
+            "width": int(session.width) if image_dependent or presentation_context else None,
+            "height": int(session.height) if image_dependent or presentation_context else None,
+            "precision": str(session.precision) if image_dependent or presentation_connected else None,
+            "colour_space": str(session.colour_space) if image_dependent or presentation_connected else None,
+            "render_mode": str(session.render_mode) if image_dependent or presentation_context else None,
+            "frame": int(animation.get("frame_number", 0)) if dynamic else None,
+            "frame_position": (
+                round(float(animation.get("frame_position", 0.0)), 6) if dynamic else None
+            ),
+            "geometry_preview_options": dict(session.preview_options) if uv_preview else None,
+            "bake_preview_output": selected_bake_map,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         key = "geometry:" + hashlib.blake2b(encoded, digest_size=20).hexdigest()
-        return key, revision, dynamic
+        presentation_payload = {
+            "presentation_revision": presentation_revision,
+            "width": int(session.width) if presentation_context else None,
+            "height": int(session.height) if presentation_context else None,
+            "precision": str(session.precision) if presentation_connected else None,
+            "colour_space": str(session.colour_space) if presentation_connected else None,
+            "render_mode": str(session.render_mode) if presentation_context else None,
+            "frame": int(animation.get("frame_number", 0)) if presentation_dynamic else None,
+            "frame_position": (
+                round(float(animation.get("frame_position", 0.0)), 6)
+                if presentation_dynamic else None
+            ),
+            "geometry_preview_options": dict(session.preview_options) if uv_preview else None,
+            "bake_preview_output": selected_bake_map,
+        }
+        presentation_encoded = json.dumps(
+            presentation_payload, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        presentation_token = hashlib.blake2b(presentation_encoded, digest_size=16).hexdigest()
+        mesh_key = self._geometry_mesh_cache_key(
+            revision=revision,
+            source_uid=source_uid,
+            output_name=output_name,
+            session=session,
+            image_dependent=image_dependent,
+            dynamic=content_dynamic,
+        )
+        return key, revision, dynamic, mesh_key, presentation_token
 
     def _cached_geometry_mesh(
         self,
@@ -1884,7 +2130,7 @@ class MainWindow(QMainWindow):
         final: bool = False,
     ) -> tuple[MeshData | None, str | None, str | None, bool]:
         session = self._geometry_evaluation_session(snapshot, final=final)
-        cache_key, revision, dynamic = self._geometry_cache_key(
+        cache_key, revision, dynamic, mesh_cache_key, _presentation_token = self._geometry_cache_key(
             snapshot, source_uid, output_name, session
         )
         cached = self._geometry_result_cache.get(cache_key)
@@ -1893,10 +2139,18 @@ class MainWindow(QMainWindow):
         result = session.evaluate(source_uid, output_name)
         if result.error or result.geometry is None:
             return None, revision, result.error or "No geometry was produced", False
-        mesh = self._mesh_from_geometry(result.geometry, cache_key=cache_key)
+        mesh = self._mesh_from_geometry(result.geometry, cache_key=mesh_cache_key)
         self._geometry_result_cache.put(
             cache_key,
-            CachedGeometryMesh(result.geometry, mesh, revision, dynamic),
+            CachedGeometryMesh(
+                result.geometry, mesh, revision, dynamic,
+                node_metadata=getattr(result, "node_metadata", {}) or {},
+                preview_image=getattr(result, "preview_image", None),
+                preview_material_texture=getattr(result, "preview_material_texture", None),
+                preview_material_textures=getattr(result, "preview_material_textures", {}) or {},
+                preview_details=str(getattr(result, "preview_details", "") or ""),
+                preview_kind=str(getattr(result, "preview_kind", "") or ""),
+            ),
         )
         return mesh, revision, None, False
 
@@ -1921,6 +2175,11 @@ class MainWindow(QMainWindow):
             precision=self.document.texture_precision,
             colour_space=self.document.colour_space,
             render_mode=render_mode,
+            preview_options=(
+                self.preview_panel.uv_preview_options()
+                if not final and hasattr(self, "preview_panel")
+                else {}
+            ),
             **self._animation_context(),
         )
 
@@ -1947,26 +2206,479 @@ class MainWindow(QMainWindow):
             return None, error or "No geometry was produced"
         return mesh, None
 
-    def _show_geometry_node(self, node) -> bool:
-        mesh, error = self._evaluate_geometry_node(node)
-        if mesh is None:
-            if node is not None:
-                node.set_error(error or "Geometry evaluation failed")
-            self.preview_3d_panel.clear_geometry_override()
-            self.preview_3d_panel.set_active_output(True, node.definition.name if node is not None else "Geometry")
-            self.preview_3d_panel.set_error(error or "Geometry evaluation failed")
-            return False
-        node.set_error(None)
-        self.preview_3d_panel.show_geometry(mesh, name=str(node.parameters.get("name", node.definition.name)))
-        self.preview_panel.set_result(
-            node.definition.name,
-            None,
-            None,
-            0,
-            0,
-            self.document.working_precision,
+    def _clear_geometry_node_activity(self) -> None:
+        activity = getattr(self, "_geometry_node_activity", None)
+        if activity:
+            for uid in tuple(activity):
+                self.scene.set_node_evaluation_state(uid, False)
+            activity.clear()
+
+    def _geometry_output_for_node(self, node) -> str:
+        output_name = self._active_output_name(node)
+        if output_name:
+            return str(output_name)
+        if node.definition.type_id == "output.geometry":
+            return "Geometry"
+        if node.definition.type_id == GRAPH_INSTANCE_TYPE:
+            public = self._graph_instance_output(node, "geometry")
+            return str(public.get("port", "Geometry")) if public is not None else "Geometry"
+        return next(
+            (name for name in node.definition.output_names if node.output_data_kind(name) == "geometry"),
+            "Geometry",
         )
+
+    def _schedule_geometry_preview(self, node=None, *, immediate: bool = False) -> None:
+        if not hasattr(self, "geometry_preview_timer"):
+            return
+        node = node or getattr(self.scene, "active_node", None)
+        if not self._is_geometry_preview_node(node):
+            return
+        self._pending_geometry_node_uid = str(node.uid)
+        # A native call already executing in its worker cannot always stop in
+        # the middle of the C++ collapse loop, but its result is invalidated
+        # immediately and never presented. The debounce below prevents a queue
+        # of obsolete requests during slider drags.
+        if self._geometry_preview_in_flight:
+            self.geometry_controller.cancel()
+            self._geometry_preview_in_flight = False
+            self._pending_geometry_request = None
+            self._clear_geometry_node_activity()
+            self.evaluation_inspector.cancel_job()
+        self.geometry_preview_timer.stop()
+        delay = 0 if immediate else int(self._geometry_preview_debounce_ms)
+        self.geometry_preview_timer.start(delay)
+
+    def _dispatch_pending_geometry_preview(self) -> None:
+        uid = self._pending_geometry_node_uid
+        self._pending_geometry_node_uid = None
+        node = self.scene.nodes.get(uid) if uid else None
+        if node is None or node is not self.scene.active_node or not self._is_geometry_preview_node(node):
+            return
+        self._show_geometry_node(node)
+
+    def _show_geometry_node(self, node) -> bool:
+        if node is None:
+            return False
+        graph = GraphSnapshot.from_scene(self.scene)
+        self._refresh_manual_node_staleness(node, graph)
+        output_name = self._geometry_output_for_node(node)
+        session = self._geometry_evaluation_session(graph)
+        cache_key, revision, dynamic, mesh_cache_key, presentation_token = self._geometry_cache_key(
+            graph, node.uid, output_name, session
+        )
+        cached = self._geometry_result_cache.get(cache_key)
+        if cached is not None:
+            self.geometry_controller.cancel()
+            self._geometry_preview_in_flight = False
+            self._pending_geometry_request = None
+            self._clear_geometry_node_activity()
+            cached_metadata = dict(getattr(cached, "node_metadata", {}) or {})
+            node_stats = dict(cached_metadata.get(str(node.uid), {}) or {})
+            node_stats.update({
+                "_geometry_output_vertex_count": cached.geometry.vertex_count,
+                "_geometry_output_triangle_count": cached.geometry.triangle_count,
+                "_geometry_output_memory_bytes": int(
+                    cached.geometry.vertices.nbytes + cached.geometry.indices.nbytes
+                ),
+            })
+            cached_metadata[str(node.uid)] = node_stats
+            self._apply_geometry_node_metadata(cached_metadata)
+            node.set_error(None)
+            self.preview_3d_panel.set_active_output(
+                True, str(node.parameters.get("name", node.definition.name))
+            )
+            self.preview_3d_panel.show_geometry(
+                cached.mesh,
+                name=str(node.parameters.get("name", node.definition.name)),
+                preview_texture=getattr(cached, "preview_material_texture", None),
+                preview_textures=getattr(cached, "preview_material_textures", {}) or {},
+                preview_settings={"normal_y": str(node.parameters.get("normal_y", "OpenGL (+Y)"))},
+            )
+            cached_preview = getattr(cached, "preview_image", None)
+            if isinstance(cached_preview, np.ndarray):
+                self.preview_panel.set_result(
+                    node.definition.name, None, None, cached_preview.shape[1], cached_preview.shape[0],
+                    self.document.working_precision,
+                    details_override=str(getattr(cached, "preview_details", "") or "UV layout"),
+                    data_kind=str(getattr(cached, "preview_kind", "uv") or "uv"),
+                    display_rgba=cached_preview,
+                )
+            else:
+                self.preview_panel.set_result(
+                    node.definition.name, None, None, 0, 0, self.document.working_precision
+                )
+            self.statusBar().showMessage(
+                f"Geometry cache hit · {node.definition.name}", 2500
+            )
+            return True
+
+        self.geometry_controller.cancel()
+        self._clear_geometry_node_activity()
+        self._pending_geometry_request = {
+            "node_uid": str(node.uid),
+            "output_name": str(output_name),
+            "cache_key": cache_key,
+            "mesh_cache_key": mesh_cache_key,
+            "presentation_token": presentation_token,
+            "revision": revision,
+            "dynamic": bool(dynamic),
+            "scene_id": id(self.scene),
+            "session_uid": str(getattr(self, "_active_graph_session_uid", "") or ""),
+            "display_name": str(node.parameters.get("name", node.definition.name)),
+        }
+        self._geometry_preview_in_flight = True
+        self.preview_3d_panel.set_active_output(True, self._pending_geometry_request["display_name"])
+        self.geometry_controller.request(session, node.uid, output_name)
         return True
+
+    def _geometry_preview_started(self) -> None:
+        request = self._pending_geometry_request or {}
+        node = self.scene.nodes.get(str(request.get("node_uid", "")))
+        target = str(request.get("display_name", "Geometry"))
+        job_id = self._next_evaluation_job("geometry")
+        self.evaluation_inspector.begin_job(
+            job_id, "Evaluating geometry", target, 0, 0, "Background · latest edit wins"
+        )
+        self._clear_geometry_node_activity()
+        if node is not None:
+            detail = f"{node.definition.name} — preparing geometry…"
+            self._geometry_node_activity[node.uid] = detail
+            self.scene.set_node_evaluation_state(node.uid, True, 0, 0, detail)
+        self.preview_3d_panel.set_busy(True, "Evaluating geometry in the background…")
+        if node is not None and node.definition.type_id == "geometry.uv_unwrap":
+            self.preview_panel.set_busy(True, "Preparing UV layout…")
+        elif node is not None and node.definition.type_id == "geometry.bake_high_to_low":
+            self.preview_panel.set_busy(True, "Baking high-to-low maps…")
+
+    def _geometry_preview_progress(self, current: int, target: int, message: str) -> None:
+        detail = str(message or "Processing geometry…")
+        if target > 0:
+            detail = f"{detail} — {current} of {target}"
+        self.preview_3d_panel.set_busy(True, detail)
+        self.statusBar().showMessage(detail)
+
+    def _geometry_node_state(
+        self, node_uid: str, active: bool, current: int, target: int, message: str
+    ) -> None:
+        self.scene.set_node_evaluation_state(node_uid, active, current, target, message)
+        node = self.scene.nodes.get(node_uid)
+        name = node.definition.name if node is not None else "Geometry stage"
+        self.evaluation_inspector.update_node(
+            self._evaluation_job_id, node_uid, name, active, current, target, message
+        )
+        activity = self._geometry_node_activity
+        if active:
+            detail = str(message or f"Evaluating {name}…")
+            if target > 0 and " of " not in detail:
+                detail = f"{detail} — {current} of {target}"
+            activity.pop(node_uid, None)
+            activity[node_uid] = detail
+            self.preview_3d_panel.set_busy(True, detail)
+            self.statusBar().showMessage(detail)
+            return
+        activity.pop(node_uid, None)
+        if activity:
+            self.preview_3d_panel.set_busy(True, next(reversed(activity.values())))
+        elif self._geometry_preview_in_flight:
+            self.preview_3d_panel.set_busy(True, "Geometry — uploading mesh to the renderer…")
+
+    def _manual_geometry_input_revision(self, node, snapshot: GraphSnapshot | None = None) -> str:
+        """Hash every authored input to a manual operation, not just a port named Geometry."""
+        if node is None:
+            return ""
+        graph = snapshot or GraphSnapshot.from_scene(self.scene)
+        entries: list[tuple[str, str, str, str]] = []
+        try:
+            for input_name in node.definition.inputs:
+                if input_name in node.definition.presentation_only_inputs:
+                    continue
+                source = graph.inputs.get((str(node.uid), str(input_name)))
+                if source is None:
+                    entries.append((str(input_name), "", "", "disconnected"))
+                    continue
+                source_uid, source_output = str(source[0]), str(source[1] or "")
+                entries.append((
+                    str(input_name), source_uid, source_output,
+                    str(self.evaluator.branch_revision(graph, source_uid)),
+                ))
+            if not entries:
+                return ""
+            encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            return hashlib.blake2b(encoded, digest_size=20).hexdigest()
+        except Exception:
+            return ""
+
+    def _refresh_manual_node_staleness(
+        self, node, snapshot: GraphSnapshot | None = None
+    ) -> bool:
+        """Synchronise manual status without evaluating or replacing its result."""
+        if (
+            node is None
+            or not node.definition.manual_action_label
+            or not node.parameters.get("_manual_result_data")
+            or str(node.parameters.get("_manual_status", "")) in {"Running", "Cancelling"}
+        ):
+            return False
+        graph = snapshot or GraphSnapshot.from_scene(self.scene)
+        applied = node.parameters.get("_manual_applied_parameters", {})
+        settings_changed = bool(
+            isinstance(applied, dict)
+            and any(
+                node.parameters.get(name) != applied.get(name)
+                for name in node.definition.manual_action_relevant_parameters
+            )
+        )
+        stored_input = str(node.parameters.get("_manual_input_revision", "") or "")
+        current_input = self._manual_geometry_input_revision(node, graph)
+        input_changed = bool(stored_input and current_input != stored_input)
+        desired = "Out of Date" if settings_changed or input_changed else "Up to Date"
+        current = str(node.parameters.get("_manual_status", "") or "")
+        # Preserve an explicit failure/cancellation explanation until the artist
+        # edits or reruns. Its previous result is still valid, but the status is
+        # more useful than silently turning green again.
+        if current in {"Failed", "Cancelled"} and desired == "Up to Date":
+            return False
+        if current == desired:
+            return False
+        node.parameters["_manual_status"] = desired
+        if desired == "Out of Date":
+            node.parameters["_manual_last_error"] = ""
+        self._mark_document_dirty()
+        if node is self.scene.active_node:
+            QTimer.singleShot(0, lambda n=node: self.parameters_panel.set_item(n))
+        return True
+
+    def _apply_geometry_node_metadata(self, metadata: dict[str, dict]) -> None:
+        changed_active = False
+        manual_metadata_changed = False
+        manual_keys = {
+            "_manual_status", "_manual_completed_serial", "_manual_signature",
+            "_manual_result_data", "_manual_last_error",
+            "_manual_applied_parameters", "_manual_changed_during_run",
+            "_manual_input_revision", "_manual_result_revision",
+        }
+        graph_snapshot = None
+        for uid, values in (metadata or {}).items():
+            node = self.scene.nodes.get(str(uid))
+            if node is None or not isinstance(values, dict):
+                continue
+            old_manual = {key: node.parameters.get(key) for key in manual_keys}
+            for key, value in values.items():
+                node.parameters[str(key)] = value
+            if node.definition.manual_action_label:
+                applied = node.parameters.get("_manual_applied_parameters", {})
+                changed_during_run = bool(node.parameters.pop("_manual_changed_during_run", False))
+                if isinstance(applied, dict) and node.parameters.get("_manual_result_data"):
+                    if graph_snapshot is None:
+                        graph_snapshot = GraphSnapshot.from_scene(self.scene)
+                    current_input_revision = self._manual_geometry_input_revision(node, graph_snapshot)
+                    input_changed = (
+                        bool(node.parameters.get("_manual_input_revision"))
+                        and current_input_revision != str(node.parameters.get("_manual_input_revision", ""))
+                    )
+                    if changed_during_run or input_changed or any(
+                        node.parameters.get(name) != applied.get(name)
+                        for name in node.definition.manual_action_relevant_parameters
+                    ):
+                        node.parameters["_manual_status"] = "Out of Date"
+                new_manual = {key: node.parameters.get(key) for key in manual_keys}
+                manual_metadata_changed = manual_metadata_changed or new_manual != old_manual
+            changed_active = changed_active or node is self.scene.active_node or node.isSelected()
+        if manual_metadata_changed:
+            self._mark_document_dirty()
+        if changed_active and self.scene.active_node is not None:
+            QTimer.singleShot(0, lambda: self.parameters_panel.set_item(self.scene.active_node))
+
+    def _geometry_preview_ready(self, result) -> None:
+        request = self._pending_geometry_request
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_request = None
+        self._clear_geometry_node_activity()
+        if request is None:
+            return
+        if (
+            request.get("scene_id") != id(self.scene)
+            or request.get("session_uid") != str(getattr(self, "_active_graph_session_uid", "") or "")
+        ):
+            self.evaluation_inspector.cancel_job()
+            return
+        node = self.scene.nodes.get(str(request.get("node_uid", "")))
+        if node is None or node is not self.scene.active_node:
+            self.evaluation_inspector.cancel_job()
+            return
+        self._apply_geometry_node_metadata(getattr(result, "node_metadata", {}) or {})
+        error = getattr(result, "error", None)
+        geometry = getattr(result, "geometry", None)
+        if error or geometry is None:
+            message = str(error or "No geometry was produced")
+            if node.definition.manual_action_label:
+                requested = int(node.parameters.get("_manual_run_serial", 0) or 0)
+                node.parameters["_manual_completed_serial"] = requested
+                node.parameters["_manual_status"] = "Failed"
+                node.parameters["_manual_last_error"] = message
+                node.parameters["_manual_changed_during_run"] = False
+                self._mark_document_dirty()
+                self.parameters_panel.set_item(node)
+            node.set_error(message)
+            self.preview_3d_panel.clear_geometry_override()
+            self.preview_3d_panel.set_active_output(True, node.definition.name)
+            self.preview_3d_panel.set_error(message)
+            self.evaluation_inspector.fail_job(self._evaluation_job_id, message)
+            self.statusBar().showMessage(message, 5000)
+            return
+        cache_key = str(request["cache_key"])
+        mesh_cache_key = str(request.get("mesh_cache_key", cache_key))
+        revision = str(request["revision"])
+        dynamic = bool(request["dynamic"])
+        presentation_changed = False
+        # Manual publication updates the node's persistent result only after the
+        # worker succeeds. Recompute the authored-output identity now so the new
+        # mesh cannot accidentally reuse the previous result's GPU buffers and
+        # the next focus change immediately hits the completed-result cache.
+        try:
+            current_graph = GraphSnapshot.from_scene(self.scene)
+            current_session = self._geometry_evaluation_session(current_graph)
+            (
+                current_cache_key,
+                current_revision,
+                current_dynamic,
+                current_mesh_cache_key,
+                current_presentation_token,
+            ) = self._geometry_cache_key(
+                current_graph, node.uid, str(request.get("output_name", "Geometry")), current_session
+            )
+            mesh_cache_key = current_mesh_cache_key
+            revision = current_revision
+            dynamic = current_dynamic
+            presentation_changed = (
+                str(current_presentation_token)
+                != str(request.get("presentation_token", current_presentation_token))
+            )
+            if not presentation_changed:
+                cache_key = current_cache_key
+        except Exception:
+            # Presentation still succeeds with the request identity; a later
+            # focus refresh can rebuild the cache if graph state changed.
+            pass
+        mesh = self._mesh_from_geometry(geometry, cache_key=mesh_cache_key)
+        self._geometry_result_cache.put(
+            cache_key,
+            CachedGeometryMesh(
+                geometry, mesh, revision, dynamic,
+                node_metadata=getattr(result, "node_metadata", {}) or {},
+                preview_image=getattr(result, "preview_image", None),
+                preview_material_texture=getattr(result, "preview_material_texture", None),
+                preview_material_textures=getattr(result, "preview_material_textures", {}) or {},
+                preview_details=str(getattr(result, "preview_details", "") or ""),
+                preview_kind=str(getattr(result, "preview_kind", "") or ""),
+            ),
+        )
+        node.set_error(None)
+        self.preview_3d_panel.show_geometry(
+            mesh,
+            name=str(request["display_name"]),
+            preview_texture=getattr(result, "preview_material_texture", None),
+            preview_textures=getattr(result, "preview_material_textures", {}) or {},
+            preview_settings={"normal_y": str(node.parameters.get("normal_y", "OpenGL (+Y)"))},
+        )
+        self.preview_3d_panel.set_busy(False)
+        preview_image = getattr(result, "preview_image", None)
+        if isinstance(preview_image, np.ndarray):
+            self.preview_panel.set_result(
+                node.definition.name, None, None, preview_image.shape[1], preview_image.shape[0],
+                self.document.working_precision,
+                details_override=str(getattr(result, "preview_details", "") or "UV layout"),
+                data_kind=str(getattr(result, "preview_kind", "uv") or "uv"),
+                display_rgba=preview_image,
+            )
+        else:
+            self.preview_panel.set_result(
+                node.definition.name, None, None, 0, 0, self.document.working_precision
+            )
+        self.evaluation_inspector.finish_job(self._evaluation_job_id, result)
+        self.statusBar().showMessage(
+            f"Geometry ready · {geometry.vertex_count:,} vertices · "
+            f"{geometry.triangle_count:,} triangles · {float(getattr(result, 'elapsed_ms', 0.0)):.1f} ms",
+            3500,
+        )
+        if presentation_changed and node is self.scene.active_node:
+            # The preview-only texture/options changed while the native job was
+            # running. Refresh just the lightweight persisted-result
+            # presentation; the unwrap itself will not run again.
+            QTimer.singleShot(0, lambda n=node: self._schedule_geometry_preview(n, immediate=True))
+
+    def _run_manual_node_action(self, node_uid: str) -> None:
+        node = self.scene.nodes.get(str(node_uid))
+        if node is None or not node.definition.manual_action_label:
+            return
+        if node is not self.scene.active_node:
+            self.scene.set_active_node(node)
+        node.parameters["_manual_input_revision"] = self._manual_geometry_input_revision(node)
+        completed = int(node.parameters.get("_manual_completed_serial", 0) or 0)
+        requested = int(node.parameters.get("_manual_run_serial", 0) or 0)
+        node.parameters["_manual_run_serial"] = max(completed, requested) + 1
+        node.parameters["_manual_status"] = "Running"
+        node.parameters["_manual_last_error"] = ""
+        node.parameters["_manual_changed_during_run"] = False
+        self.scene._touch()
+        self.parameters_panel.set_item(node)
+        self._schedule_geometry_preview(node, immediate=True)
+
+    def _cancel_manual_node_action(self, node_uid: str) -> None:
+        node = self.scene.nodes.get(str(node_uid))
+        if node is None or not node.definition.manual_action_label:
+            return
+        self.geometry_controller.cancel()
+        self.geometry_preview_timer.stop()
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_request = None
+        self._pending_geometry_node_uid = None
+        self._clear_geometry_node_activity()
+        self.evaluation_inspector.cancel_job()
+        self.preview_3d_panel.set_busy(False)
+        requested = int(node.parameters.get("_manual_run_serial", 0) or 0)
+        node.parameters["_manual_completed_serial"] = requested
+        node.parameters["_manual_status"] = "Cancelled"
+        node.parameters["_manual_last_error"] = ""
+        node.parameters["_manual_changed_during_run"] = False
+        self._mark_document_dirty()
+        self.parameters_panel.set_item(node)
+        self.statusBar().showMessage(f"{node.definition.name} cancelled; previous result retained", 3500)
+
+    def _uv_preview_options_changed(self) -> None:
+        node = getattr(self.scene, "active_node", None)
+        if node is None or not node.definition.type_id.startswith("geometry.uv_"):
+            return
+        if (
+            node.definition.manual_action_label
+            and str(node.parameters.get("_manual_status", "")) == "Running"
+        ):
+            return
+        self._schedule_geometry_preview(node, immediate=True)
+
+    def _geometry_preview_failed(self, message: str) -> None:
+        request = self._pending_geometry_request
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_request = None
+        self._clear_geometry_node_activity()
+        node = None
+        if request is not None and request.get("scene_id") == id(self.scene):
+            node = self.scene.nodes.get(str(request.get("node_uid", "")))
+        if node is not None:
+            if node.definition.manual_action_label:
+                requested = int(node.parameters.get("_manual_run_serial", 0) or 0)
+                node.parameters["_manual_completed_serial"] = requested
+                node.parameters["_manual_status"] = "Failed"
+                node.parameters["_manual_last_error"] = str(message or "Geometry evaluation failed")
+                node.parameters["_manual_changed_during_run"] = False
+                self._mark_document_dirty()
+                self.parameters_panel.set_item(node)
+            node.set_error(str(message or "Geometry evaluation failed"))
+        self.preview_3d_panel.clear_geometry_override()
+        self.preview_3d_panel.set_active_output(True, node.definition.name if node is not None else "Geometry")
+        self.preview_3d_panel.set_error(str(message or "Geometry evaluation failed"))
+        self.evaluation_inspector.fail_job(self._evaluation_job_id, str(message))
+        self.statusBar().showMessage(str(message or "Geometry evaluation failed"), 5000)
 
     def _material_geometry_state(
         self,
@@ -2931,6 +3643,13 @@ class MainWindow(QMainWindow):
         self._interactive_parameter_edit_depth = 0
         self._interactive_parameter_node_uid = None
 
+        active = getattr(self.scene, "active_node", None)
+        if self._is_geometry_preview_node(active):
+            # Settle on the exact authored mesh immediately when the user lets
+            # go. Any lower-priority request from the drag is superseded.
+            self._schedule_geometry_preview(active, immediate=True)
+            return
+
         if self._find_3d_output() is not None:
             # Material focus now drives both previews: settle the Base Colour in
             # 2D first, then let the queued 3D refresh reuse the resulting cache.
@@ -3554,6 +4273,10 @@ class MainWindow(QMainWindow):
     def _schedule_preview(self) -> None:
         if not hasattr(self, "preview_timer"):
             return
+        active = getattr(self.scene, "active_node", None)
+        if self._is_geometry_preview_node(active):
+            self._schedule_geometry_preview(active)
+            return
         preempt_thumbnail = getattr(self, "_preempt_thumbnail_work", None)
         if callable(preempt_thumbnail):
             preempt_thumbnail()
@@ -4009,6 +4732,16 @@ class MainWindow(QMainWindow):
         """Cancel background previews and make the scheduler immediately reusable."""
         if hasattr(self, "preview_timer"):
             self.preview_timer.stop()
+        if hasattr(self, "geometry_preview_timer"):
+            self.geometry_preview_timer.stop()
+        if hasattr(self, "geometry_controller"):
+            self.geometry_controller.cancel()
+        self._geometry_preview_in_flight = False
+        self._pending_geometry_request = None
+        self._pending_geometry_node_uid = None
+        clear_geometry_activity = getattr(self, "_clear_geometry_node_activity", None)
+        if callable(clear_geometry_activity):
+            clear_geometry_activity()
         preempt_thumbnail = getattr(self, "_preempt_thumbnail_work", None)
         if callable(preempt_thumbnail):
             preempt_thumbnail()
@@ -4996,6 +5729,30 @@ class MainWindow(QMainWindow):
         return self._graph_sessions.get(self._active_graph_session_uid)
 
     def _session_explorer_info(self, session: GraphDocumentSession) -> ExplorerGraphInfo:
+        try:
+            session.graph_resources.capture_scene(session.scene)
+            counts = session.graph_resources.reference_counts(session.scene)
+            folders = tuple(
+                ExplorerFolderInfo(folder.uid, folder.name, folder.parent_uid)
+                for folder in session.graph_resources.folders
+            )
+            resources = tuple(
+                ExplorerResourceInfo(
+                    uid=resource.uid,
+                    name=resource.name,
+                    kind=resource.kind,
+                    folder_uid=resource.folder_uid,
+                    status=resource.status(session.current_path)[0],
+                    status_text=resource.status(session.current_path)[1],
+                    path=str(resource.resolved_path(session.current_path) or resource.source_path),
+                    embedded=bool(resource.embedded_data),
+                    uses=int(counts.get(resource.uid, 0)),
+                )
+                for resource in session.graph_resources.resources
+            )
+        except Exception:
+            folders = ()
+            resources = ()
         return ExplorerGraphInfo(
             uid=session.uid,
             name=session.name,
@@ -5003,6 +5760,8 @@ class MainWindow(QMainWindow):
             dirty=session.dirty,
             active=session.uid == self._active_graph_session_uid,
             embedded=session.current_path is None,
+            folders=folders,
+            resources=resources,
         )
 
     def _graph_interface_for_session(self, session: GraphDocumentSession) -> dict:
@@ -5032,6 +5791,7 @@ class MainWindow(QMainWindow):
             portability = {
                 "linked_graphs": 0, "embedded_graphs": 0, "cached_graphs": 0,
                 "external_images": 0, "embedded_images": 0,
+                "external_meshes": 0, "embedded_meshes": 0,
             }
         self.parameters_panel.show_graph_properties(
             session.uid,
@@ -5207,6 +5967,7 @@ class MainWindow(QMainWindow):
         display_name: str | None = None,
         graph_asset: GraphAssetMetadata | None = None,
         export_profiles: ExportProfileLibrary | None = None,
+        graph_resources: GraphResourceLibrary | None = None,
     ) -> GraphDocumentSession:
         resolved_display_name = display_name or self._next_untitled_graph_name()
         metadata = graph_asset or GraphAssetMetadata(
@@ -5222,6 +5983,7 @@ class MainWindow(QMainWindow):
             display_name=resolved_display_name,
             graph_asset=metadata,
             export_profiles=export_profiles or ExportProfileLibrary.default(),
+            graph_resources=graph_resources or GraphResourceLibrary(),
         )
         self._graph_sessions[session.uid] = session
         scene.graphChanged.connect(
@@ -5246,6 +6008,7 @@ class MainWindow(QMainWindow):
             display_name=self.current_path.name if self.current_path else self._next_untitled_graph_name(),
             graph_asset=self.graph_asset,
             export_profiles=self.export_profiles,
+            graph_resources=self.graph_resources,
         )
         session.document_dirty = self._document_dirty
         session.recovered_dirty = self._recovered_dirty
@@ -5265,6 +6028,7 @@ class MainWindow(QMainWindow):
         session.document = self.document
         session.graph_asset = self.graph_asset
         session.export_profiles = self.export_profiles
+        session.graph_resources = self.graph_resources
         session.current_path = self.current_path.resolve() if self.current_path is not None else None
         session.document_dirty = bool(self._document_dirty)
         session.recovered_dirty = bool(self._recovered_dirty)
@@ -5316,6 +6080,7 @@ class MainWindow(QMainWindow):
             self.document = session.document
             self.graph_asset = session.graph_asset
             self.export_profiles = session.export_profiles
+            self.graph_resources = session.graph_resources
             self.current_path = session.current_path
             self.current_frame = int(session.current_frame)
             self._document_dirty = bool(session.document_dirty)
@@ -5388,6 +6153,7 @@ class MainWindow(QMainWindow):
             session.document = self.document
             session.graph_asset = self.graph_asset
             session.export_profiles = self.export_profiles
+            session.graph_resources = self.graph_resources
             session.current_path = self.current_path
             session.document_dirty = self._document_dirty
             session.recovered_dirty = self._recovered_dirty
@@ -5411,8 +6177,12 @@ class MainWindow(QMainWindow):
         if session.uid in visiting:
             raise ValueError("Recursive open-graph dependency detected while serialising.")
         visiting.add(session.uid)
+        # Keep stable resource IDs authoritative on the live scene before
+        # serialising. This matters when one node has just split away from a
+        # shared resource through a direct source or embed-mode edit.
+        session.graph_resources.capture_scene(session.scene)
         data = session.scene.to_dict()
-        data["version"] = 18
+        data["version"] = 20
         data["document"] = session.document.to_dict()
         data["graph_asset"] = session.graph_asset.to_dict()
         data["export_profiles"] = session.export_profiles.to_dict()
@@ -5446,11 +6216,14 @@ class MainWindow(QMainWindow):
                             parameters["_asset_embedded_graph"] = deepcopy(nested)
                             parameters["_asset_status"] = "Embedded from open graph"
                         parameters.pop("_asset_session_uid", None)
-            if node_data.get("type") != "input.image":
+            if node_data.get("type") not in {"input.image", "input.mesh"}:
                 continue
             if parameters.get("embedded"):
                 path = Path(str(parameters.get("path", ""))).expanduser()
+                if not path.is_absolute() and session.current_path is not None:
+                    path = session.current_path.parent / path
                 if path.is_file():
+                    path = path.resolve()
                     stat = path.stat()
                     cache_key = str(path.resolve())
                     cached = self._embedded_asset_cache.get(cache_key)
@@ -5463,6 +6236,10 @@ class MainWindow(QMainWindow):
             else:
                 parameters.pop("_embedded_data", None)
                 parameters.pop("_embedded_name", None)
+                parameters.pop("_embedded_original_name", None)
+        session.graph_resources.capture_serialized_nodes(data.get("nodes", []))
+        data["resources"] = session.graph_resources.to_dict()
+        session.graph_resources.compact_serialized_nodes(data.get("nodes", []))
         return data
 
     def _open_session_uid_for_path(self, path_value, *, owner: GraphDocumentSession | None = None) -> str | None:
@@ -5560,6 +6337,54 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.warning(self, "Could not add open graph", str(exc))
+
+    def _insert_graph_resource(
+        self, source_uid: str, resource_uid: str, position: QPointF
+    ) -> None:
+        source = self._graph_sessions.get(str(source_uid))
+        target = self._active_graph_session()
+        if source is None or target is None:
+            self.statusBar().showMessage("The dragged graph resource is no longer available.", 4000)
+            return
+
+        source.graph_resources.capture_scene(source.scene)
+        source_resource = source.graph_resources.by_id(resource_uid)
+        if source_resource is None:
+            self.statusBar().showMessage("The dragged graph resource is no longer available.", 4000)
+            return
+
+        try:
+            crossed_graphs = source.uid != target.uid
+            if crossed_graphs:
+                target_resource = target.graph_resources.copy_resource_from(
+                    source.graph_resources,
+                    source_resource.uid,
+                    source_owner_path=source.current_path,
+                )
+            else:
+                target_resource = source_resource
+
+            node_type = "input.mesh" if target_resource.kind == "mesh" else "input.image"
+            parameters = target.graph_resources.parameters_for_resource(target_resource.uid)
+            target.scene.clearSelection()
+            node = target.scene.create_node(
+                node_type, QPointF(position), parameters=parameters
+            )
+            node.setSelected(True)
+            target.graph_resources.capture_scene(target.scene)
+            if crossed_graphs:
+                self._mark_resource_library_dirty(target)
+            else:
+                self._update_graph_explorer_entry(target.uid)
+            self.graph_view._refresh_scene_bounds()
+            action = "Copied and added" if crossed_graphs else "Added"
+            self.statusBar().showMessage(
+                f"{action} {target_resource.name} as a "
+                f"{'Mesh Input' if target_resource.kind == 'mesh' else 'Image Input'}.",
+                4000,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not add graph resource", str(exc))
 
     def _bind_linked_instances_to_open_sessions(self) -> None:
         """Use the authoritative in-memory graph whenever its linked source is open.
@@ -5755,6 +6580,7 @@ class MainWindow(QMainWindow):
         if source is None:
             return
         data = self._project_data_for_session(source)
+        duplicated_resources = GraphResourceLibrary.from_project_data(data)
         scene = GraphScene(self.registry, self)
         scene.default_tiling = source.document.default_tiling
         scene.default_geometric_rasterization = source.document.default_geometric_rasterization
@@ -5769,6 +6595,7 @@ class MainWindow(QMainWindow):
                 created_with=__version__,
             ),
             export_profiles=ExportProfileLibrary.from_dict(data.get("export_profiles")),
+            graph_resources=duplicated_resources,
         )
         self.activate_graph_session(session.uid)
         self._loading = True
@@ -5979,6 +6806,204 @@ class MainWindow(QMainWindow):
         if add_graph_asset_directory(session.current_path.parent, self.settings):
             self.library_panel.rebuild()
             self.statusBar().showMessage(f"Added {session.current_path.parent} to Graph Assets", 3500)
+
+    def _resource_session(self, session_uid: str) -> GraphDocumentSession | None:
+        session = self._graph_sessions.get(str(session_uid))
+        if session is not None:
+            session.graph_resources.capture_scene(session.scene)
+        return session
+
+    def _mark_resource_library_dirty(self, session: GraphDocumentSession) -> None:
+        session.document_dirty = True
+        if session.uid == self._active_graph_session_uid:
+            self.graph_resources = session.graph_resources
+            self._document_dirty = True
+            self._update_dirty_state()
+            self._schedule_autosave()
+        self._update_graph_explorer_entry(session.uid)
+        self._refresh_graph_inspector(session.uid)
+
+    def _explorer_add_resource_folder(self, session_uid: str, parent_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        if session is None:
+            return
+        name, accepted = QInputDialog.getText(self, "New resource folder", "Folder name:", text="New Folder")
+        if not accepted or not str(name).strip():
+            return
+        session.graph_resources.add_folder(str(name), str(parent_uid or ""))
+        self._mark_resource_library_dirty(session)
+
+    def _explorer_rename_resource_folder(self, session_uid: str, folder_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        folder = session.graph_resources.folder_by_id(folder_uid) if session is not None else None
+        if session is None or folder is None:
+            return
+        name, accepted = QInputDialog.getText(self, "Rename resource folder", "Folder name:", text=folder.name)
+        if accepted and session.graph_resources.rename_folder(folder.uid, str(name)):
+            self._mark_resource_library_dirty(session)
+
+    def _explorer_remove_resource_folder(self, session_uid: str, folder_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        folder = session.graph_resources.folder_by_id(folder_uid) if session is not None else None
+        if session is None or folder is None:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Remove resource folder?")
+        box.setText(f"Remove the virtual folder '{folder.name}'?")
+        box.setInformativeText(
+            "Its subfolders and resources will move to the parent folder; no files will be deleted."
+        )
+        remove_button = box.addButton("Remove Folder", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() is remove_button and session.graph_resources.remove_folder(folder.uid):
+            self._mark_resource_library_dirty(session)
+
+    def _explorer_select_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        if session is None:
+            return
+        self.activate_graph_session(session.uid)
+        node_uids = session.graph_resources.node_uids_for_resource(session.scene, resource_uid)
+        if not node_uids:
+            self.statusBar().showMessage("This resource is not currently used by a node.", 3500)
+            return
+        self.scene.clearSelection()
+        selected = []
+        for node_uid in node_uids:
+            node = self.scene.nodes.get(node_uid)
+            if node is not None:
+                node.setSelected(True)
+                selected.append(node)
+        if selected:
+            self.scene.set_active_node(selected[0])
+            self.graph_view.centerOn(selected[0])
+            self.statusBar().showMessage(
+                f"Selected {len(selected)} node{'s' if len(selected) != 1 else ''} using this resource.",
+                3000,
+            )
+
+    @staticmethod
+    def _resource_dialog_filter(kind: str) -> tuple[str, str]:
+        if str(kind) == "mesh":
+            return "Choose OBJ mesh", "Wavefront OBJ meshes (*.obj);;All files (*)"
+        return "Choose image", "Images (*.png *.tga *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All files (*)"
+
+    def _explorer_relink_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        if session is None or resource is None:
+            return
+        title, filters = self._resource_dialog_filter(resource.kind)
+        current = str(resource.resolved_path(session.current_path) or Path.home())
+        filename, _selected = QFileDialog.getOpenFileName(self, f"Relink {resource.name}", current, filters)
+        if not filename:
+            return
+        try:
+            session.graph_resources.relink(resource.uid, filename)
+            count = session.graph_resources.apply_resource_to_scene(session.scene, resource.uid, touch=True)
+            self._mark_resource_library_dirty(session)
+            self.statusBar().showMessage(
+                f"Relinked {resource.name} for {count} node{'s' if count != 1 else ''}.", 4000
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not relink resource", str(exc))
+
+    def _explorer_embed_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        if session is None or resource is None:
+            return
+        try:
+            session.graph_resources.embed(
+                resource.uid, source_path=resource.resolved_path(session.current_path)
+            )
+            count = session.graph_resources.apply_resource_to_scene(session.scene, resource.uid, touch=True)
+            self._mark_resource_library_dirty(session)
+            self.statusBar().showMessage(
+                f"Embedded {resource.name} in the graph for {count} node{'s' if count != 1 else ''}.", 4000
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not embed resource", str(exc))
+
+    def _explorer_restore_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        if session is None or resource is None or not resource.embedded_data:
+            return
+        extension = ".obj" if resource.kind == "mesh" else Path(resource.embedded_name or resource.name).suffix
+        suggested_name = resource.embedded_name or resource.name
+        if extension and not Path(suggested_name).suffix:
+            suggested_name += extension
+        _title, filters = self._resource_dialog_filter(resource.kind)
+        filename, _selected = QFileDialog.getSaveFileName(
+            self, f"Restore {resource.name}", str(Path.home() / suggested_name), filters
+        )
+        if not filename:
+            return
+        try:
+            session.graph_resources.restore_embedded(resource.uid, filename, relink=True)
+            count = session.graph_resources.apply_resource_to_scene(session.scene, resource.uid, touch=True)
+            self._mark_resource_library_dirty(session)
+            self.statusBar().showMessage(
+                f"Restored and relinked {resource.name} for {count} node{'s' if count != 1 else ''}.", 4500
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not restore resource", str(exc))
+
+    def _explorer_reveal_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        path = resource.resolved_path(session.current_path) if resource is not None and session is not None else None
+        if path is not None and path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _explorer_rename_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        if session is None or resource is None:
+            return
+        name, accepted = QInputDialog.getText(self, "Rename graph resource", "Resource name:", text=resource.name)
+        if accepted and session.graph_resources.rename_resource(resource.uid, str(name)):
+            self._mark_resource_library_dirty(session)
+
+    def _explorer_move_resource(self, session_uid: str, resource_uid: str, folder_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        if session is not None and session.graph_resources.move_resource(resource_uid, folder_uid):
+            self._mark_resource_library_dirty(session)
+
+    def _explorer_remove_resource(self, session_uid: str, resource_uid: str) -> None:
+        session = self._resource_session(session_uid)
+        resource = session.graph_resources.by_id(resource_uid) if session is not None else None
+        if session is None or resource is None:
+            return
+        counts = session.graph_resources.reference_counts(session.scene)
+        if counts.get(str(resource_uid), 0):
+            QMessageBox.information(
+                self,
+                "Resource still in use",
+                "Delete or relink every node using this resource before removing it.",
+            )
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Remove unused resource?")
+        box.setText(f"Remove '{resource.name}' from this graph?")
+        if resource.embedded_data and not resource.source_path:
+            box.setInformativeText(
+                "This is the graph's only embedded copy. Removing it discards those source bytes when the graph is saved."
+            )
+        else:
+            box.setInformativeText("The linked file on disk will not be deleted.")
+        remove_button = box.addButton("Remove Resource", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if (
+            box.clickedButton() is remove_button
+            and session.graph_resources.remove_resource(resource_uid, referenced=0)
+        ):
+            self._mark_resource_library_dirty(session)
 
     def _mark_document_dirty(self) -> None:
         if self._switching_graph_session:
@@ -6280,6 +7305,8 @@ class MainWindow(QMainWindow):
                     continue
                 for name in moved_names:
                     parameters.pop(name, None)
+        migrate_project_resources(data)
+        data["version"] = 20
         return data
 
     def _graph_dialog_directories(self) -> list[Path]:
@@ -6399,6 +7426,7 @@ class MainWindow(QMainWindow):
                 data.get("graph_asset"), default_name=path.stem, created_with=__version__
             )
             self.export_profiles = ExportProfileLibrary.from_dict(data.get("export_profiles"))
+            self.graph_resources = GraphResourceLibrary.from_dict(data.get("resources"))
             self.current_frame = 0
             self.scene.default_tiling = self.document.default_tiling
             self.scene.default_geometric_rasterization = self.document.default_geometric_rasterization
@@ -6430,6 +7458,7 @@ class MainWindow(QMainWindow):
             session.document = self.document
             session.graph_asset = self.graph_asset
             session.export_profiles = self.export_profiles
+            session.graph_resources = self.graph_resources
             session.current_path = path.resolve()
             session.document_dirty = False
             session.recovered_dirty = False
@@ -6518,6 +7547,7 @@ class MainWindow(QMainWindow):
                     data.get("graph_asset"), default_name=asset_name, created_with=__version__
                 ),
                 export_profiles=ExportProfileLibrary.from_dict(data.get("export_profiles")),
+                graph_resources=GraphResourceLibrary.from_dict(data.get("resources")),
             )
             session.viewport_state = deepcopy(data.get("viewport_3d") or {})
             session.current_frame = 0
@@ -6886,6 +7916,7 @@ class MainWindow(QMainWindow):
             f"{info.name} · version {info.asset_version}\n"
             f"{len(info.files)} packaged file{'s' if len(info.files) != 1 else ''}\n\n"
             f"Image source files: {len(info.image_sources) if include_image_sources else 0}\n"
+            f"Mesh source files: {len(info.mesh_sources)}\n"
             f"Image fallback mode: embedded copies retained\n"
             f"Export templates: {len(info.export_templates)} included as .vfxexport files\n\n"
             f"{details}\n\nThe open source graph was left unchanged.",
@@ -7170,6 +8201,7 @@ class MainWindow(QMainWindow):
             display_name=display_name,
             graph_asset=metadata,
             export_profiles=ExportProfileLibrary.from_dict(migrated.get("export_profiles")),
+            graph_resources=GraphResourceLibrary.from_dict(migrated.get("resources")),
         )
         self.activate_graph_session(session.uid)
         self._loading = True
@@ -7177,6 +8209,7 @@ class MainWindow(QMainWindow):
             self.document = document
             self.graph_asset = metadata
             self.export_profiles = ExportProfileLibrary.from_dict(migrated.get("export_profiles"))
+            self.graph_resources = GraphResourceLibrary.from_dict(migrated.get("resources"))
             self.current_frame = 0
             self.scene.default_tiling = document.default_tiling
             self.scene.default_geometric_rasterization = document.default_geometric_rasterization
@@ -7196,6 +8229,7 @@ class MainWindow(QMainWindow):
         session.document = self.document
         session.graph_asset = self.graph_asset
         session.export_profiles = self.export_profiles
+        session.graph_resources = self.graph_resources
         session.current_path = None
         session.document_dirty = False
         session.recovered_dirty = False
@@ -7277,17 +8311,22 @@ class MainWindow(QMainWindow):
             session.document = self.document
             session.graph_asset = self.graph_asset
             session.export_profiles = self.export_profiles
+            session.graph_resources = self.graph_resources
             session.current_path = self.current_path
             session.document_dirty = self._document_dirty
             session.recovered_dirty = self._recovered_dirty
             session.current_frame = self.current_frame
             session.viewport_state = deepcopy(self.preview_3d_panel.project_state())
             return self._project_data_for_session(session)
+        self.graph_resources.capture_scene(self.scene)
         data = self.scene.to_dict()
-        data["version"] = 18
+        data["version"] = 20
         data["document"] = self.document.to_dict()
         data["graph_asset"] = self.graph_asset.to_dict()
         data["export_profiles"] = self.export_profiles.to_dict()
+        self.graph_resources.capture_serialized_nodes(data.get("nodes", []))
+        data["resources"] = self.graph_resources.to_dict()
+        self.graph_resources.compact_serialized_nodes(data.get("nodes", []))
         data["viewport_3d"] = self.preview_3d_panel.project_state()
         return data
 
@@ -7482,6 +8521,7 @@ class MainWindow(QMainWindow):
                 data.get("graph_asset"), default_name=default_asset_name, created_with=__version__
             )
             self.export_profiles = ExportProfileLibrary.from_dict(data.get("export_profiles"))
+            self.graph_resources = GraphResourceLibrary.from_dict(data.get("resources"))
             self.current_frame = 0
             self.scene.default_tiling = self.document.default_tiling
             self.scene.default_geometric_rasterization = self.document.default_geometric_rasterization
@@ -7517,6 +8557,7 @@ class MainWindow(QMainWindow):
             session.document = self.document
             session.graph_asset = self.graph_asset
             session.export_profiles = self.export_profiles
+            session.graph_resources = self.graph_resources
             session.current_path = self.current_path
             session.document_dirty = False
             session.recovered_dirty = True
@@ -8223,7 +9264,7 @@ class MainWindow(QMainWindow):
             "About VFX Texture Lab",
             f"<b>VFX Texture Lab {__version__}</b><br><br>"
             "A focused, open-source procedural texture graph for VFX artists.<br><br>"
-            "0.50.1 adds automated Windows packages and correct display-sRGB colour authoring for the Colour generator.",
+            "0.53.0.3 corrects tangent-axis orientation on mirrored UV charts so baked normal maps, the 3D Preview and Height to Normal use one consistent convention.",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -8246,9 +9287,11 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.playback_timer.stop()
         self.preview_timer.stop()
+        self.geometry_preview_timer.stop()
         self.material_preview_timer.stop()
         self.material_present_timer.stop()
         self.eval_controller.cancel()
+        self.geometry_controller.cancel()
         self.playback_controller.cancel()
         self.material_controller.cancel()
         self.evaluator.clear_cache()

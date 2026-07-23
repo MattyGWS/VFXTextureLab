@@ -17,7 +17,7 @@ VFX Texture Lab is aimed at effects such as:
 - Flipbook sheets and loopable procedural animation
 - Terrain, erosion, surface analysis and scan cleanup
 - Reusable PBR material graphs and channel-packed texture sets
-- VFX cards, ribbons, rings, beams and simple procedural meshes
+- VFX cards, ribbons, rings, beams, imported OBJ meshes and simple procedural geometry
 - Portable graph assets that can be shared or reused as ordinary nodes
 
 The application is not intended to replace a full polygon modeller or DCC. Its geometry workflow focuses on procedural meshes that are useful for VFX construction, preview and export alongside the generated textures.
@@ -43,9 +43,9 @@ The application is not intended to replace a full polygon modeller or DCC. Its g
 
 ### Procedural geometry
 
-Geometry uses a dedicated typed graph value and exports as indexed, UV-mapped Wavefront OBJ data.
+Geometry uses a dedicated typed graph value. It can be generated procedurally, imported from Wavefront OBJ, previewed with graph materials and exported as indexed, UV-mapped OBJ data.
 
-Current generators include:
+Geometry sources include **Mesh Input** for linked or embedded Wavefront OBJ files, plus these procedural generators:
 
 - Plane
 - Box
@@ -55,16 +55,19 @@ Current generators include:
 
 Current operations include:
 
-- Transform
-- Combine
-- Subdivide
+- Transform and Combine
+- Delete Small Parts for automated scan-fragment cleanup
+- Voxel Remesh
+- Native percentage-based Decimate with topology protection
+- Subdivide and Un-Subdivide
 - Displace from a greyscale heightmap
 - Rebuild smooth, angle-limited or flat normals
 - Bend and Twist
-- UV Transform
+- UV Transform and manual Automatic Charts UV Unwrap
+- High-to-low Albedo, tangent Normal, signed Height and AO baking
 - Clean and Weld
 
-Generated meshes support artist-controlled pivots, XYZ rotation, UV tiling and focused 3D inspection. Dense static branches and their vertex/index buffers remain cached across unrelated Material changes.
+Generated meshes support artist-controlled pivots, XYZ rotation, UV tiling and focused 3D/UV inspection. Dense static branches and their vertex/index buffers remain cached across unrelated Material changes. High-poly import, simplification, remeshing, unwrapping and baking use cancellable background work with progress feedback and detailed diagnostics.
 
 ### Animation and simulation
 
@@ -83,6 +86,7 @@ Generated meshes support artist-controlled pivots, XYZ rotation, UV tiling and f
 - Named Send/Receive portals for long-distance connections
 - Graph Input and Graph Output nodes for turning a complete graph into a reusable node
 - Multi-document Graph Explorer with linked or embedded graph instances
+- Graph-owned image and mesh resources with virtual folders, shared relinking, embedding, restoration and missing-source status
 - Optional node thumbnails and graph-asset thumbnails
 - Self-contained graph export, dependency recovery and missing-resource reporting
 
@@ -104,16 +108,17 @@ Generated meshes support artist-controlled pivots, XYZ rotation, UV tiling and f
 - Wavefront OBJ geometry export with UV and normal controls
 - Shareable `.vfxexport` export-template files
 - Portable self-contained `.vfxgraph` files
-- Validated installable `.vfxpackage` archives with optional source images, thumbnails and dependencies
+- Validated installable `.vfxpackage` archives with optional source images, OBJ meshes, thumbnails and dependencies
 
 ## Typical workflow
 
-1. Create or import source textures, noises, masks and signals.
+1. Create or import source textures, OBJ meshes, noises, masks and signals.
 2. Build procedural image branches and preview any intermediate output directly.
 3. Assemble channels into a Material and inspect it in the 3D Preview.
-4. Generate or process Geometry when the effect needs a custom card, ring, ribbon or displaced mesh.
-5. Animate parameters with Time, Loop Phase or curves and test playback on the final material.
-6. Export individual textures, a complete texture set, a flipbook, an OBJ mesh or a portable graph package.
+4. Generate or process Geometry when the effect needs a custom card, ring, ribbon, displaced mesh or cleaned photogrammetry asset.
+5. For scans, clean/remesh/decimate a low mesh, unwrap it and bake Albedo, Normal, Height and AO from the original high mesh.
+6. Animate parameters with Time, Loop Phase or curves and test playback on the final material.
+7. Export individual textures, a complete texture set, a flipbook, an OBJ mesh or a portable graph package.
 
 Because every major output is typed, texture, material, signal and mesh branches remain visually distinct and cannot be connected accidentally without an appropriate conversion or composition node.
 
@@ -140,10 +145,10 @@ The Inspector and GPU/Renderer Diagnostics expose timing and cache information w
 | `.vfxpackage` | Validated installable graph package with dependencies and metadata |
 | `.vfxexport` | Shareable texture-set export template |
 | `.vfxnodepkg` | Installable custom node package |
-| `.obj` | Exported procedural geometry |
+| `.obj` | Imported or exported mesh geometry |
 | `.png`, `.tga`, `.r16` | Exported texture data |
 
-Graph assets can be linked for live library updates or embedded for portability. Self-contained export recursively embeds reachable graph instances and image sources required to reproduce the result.
+Graph assets can be linked for live library updates or embedded for portability. Imported images and meshes are graph-owned resources that may remain linked or be embedded for recovery and sharing. Self-contained export recursively embeds reachable graph instances, image sources and OBJ mesh sources required to reproduce the result.
 
 ## Installation
 
@@ -155,7 +160,7 @@ The first public builds are unsigned, so Microsoft Defender SmartScreen may ask 
 
 ### Running from source
 
-Source testing remains available on Windows and Linux for contributors. Install Python 3.11 or newer, extract or clone the complete repository, then run `setup.bat` / `run.bat` on Windows or:
+Source testing remains available on Windows and Linux for contributors. On Windows, use 64-bit Python 3.11-3.13. On Linux, any 64-bit Python 3.11 or newer can bootstrap setup; when the system Python is 3.14+, `setup.sh` automatically creates a private managed Python 3.13 environment so native xatlas, Embree, SciPy and scikit-image wheels install without local compilation. Extract or clone the complete repository, then run `setup.bat` / `run.bat` on Windows or:
 
 ```bash
 bash setup.sh
@@ -176,10 +181,13 @@ Detailed subsystem documentation is available in [`docs/`](docs/), including:
 - [`GEOMETRY_FOUNDATION.md`](docs/GEOMETRY_FOUNDATION.md)
 - [`GEOMETRY_TOOLKIT.md`](docs/GEOMETRY_TOOLKIT.md)
 - [`GEOMETRY_SHAPING.md`](docs/GEOMETRY_SHAPING.md)
+- [`GEOMETRY_BAKING.md`](docs/GEOMETRY_BAKING.md)
 - [`GRAPH_ASSETS.md`](docs/GRAPH_ASSETS.md)
+- [`MESH_INPUT_AND_RESOURCES.md`](docs/MESH_INPUT_AND_RESOURCES.md)
 - [`EXPORTING.md`](docs/EXPORTING.md)
 - [`SIMULATIONS.md`](docs/SIMULATIONS.md)
 - [`WINDOWS_RELEASES.md`](docs/WINDOWS_RELEASES.md)
+- [`TESTING_0.53.0.md`](docs/TESTING_0.53.0.md)
 
 Release notes are maintained exclusively in [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -195,4 +203,4 @@ The project is in public beta. Windows x64 binaries are built automatically by G
 
 ## License
 
-VFX Texture Lab is released under the [MIT License](LICENSE).
+VFX Texture Lab is released under the [MIT License](LICENSE). Native and Python dependency notices are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

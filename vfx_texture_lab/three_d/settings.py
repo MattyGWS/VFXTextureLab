@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from ..geometry_limits import AUTO_WIREFRAME_TRIANGLE_LIMIT
 from ..material import SURFACE_MODES
 
 

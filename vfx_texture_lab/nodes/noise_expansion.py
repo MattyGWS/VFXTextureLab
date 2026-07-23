@@ -851,6 +851,65 @@ def eval_fractal_sum(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any
     return _common_finish(value.astype(np.float32), params)
 
 
+def _max_abs_cos_over_interval(center: float, half_span: float, phase: float = 0.0) -> float:
+    """Maximum absolute cosine over an angular interval.
+
+    ``phase`` allows the same helper to cover sine via ``phase=pi/2``.
+    The exact interval bound keeps long, mostly aligned Fur strands cheap: a
+    vertical strand expands the Y neighbourhood without needlessly scanning a
+    large square in X.
+    """
+    start = float(center - half_span - phase)
+    end = float(center + half_span - phase)
+    first_peak = math.ceil(start / math.pi)
+    last_peak = math.floor(end / math.pi)
+    if first_peak <= last_peak:
+        return 1.0
+    return max(abs(math.cos(start)), abs(math.cos(end)))
+
+
+def _segment_search_radii(
+    *,
+    length: float,
+    width: float,
+    softness: float,
+    angle_degrees: float,
+    angle_random: float,
+    rounded_profile: bool,
+) -> tuple[int, int]:
+    """Return the cell neighbourhood required to contain whole strands.
+
+    Legacy Fibres keep their historical 3x3 neighbourhood.  Fur can be much
+    longer, so its rounded-profile passes expand only along axes the possible
+    strand angles can actually reach.  This prevents a strand from vanishing
+    at an internal cell boundary before its longitudinal dome reaches black.
+    """
+    if not rounded_profile:
+        return 1, 1
+
+    base_angle = math.radians(float(angle_degrees))
+    # Random angle contributes +/- 0.5 of the control, while the animated
+    # sway contributes another +/- 0.08.
+    deviation = math.radians(abs(float(angle_random))) * 0.58
+    max_half_length = max(float(length), 0.02) * 1.35 * 0.5
+    max_local_width = max(float(width), 0.002) * 1.3
+    max_radial_reach = max_local_width * (1.05 + 1.5 * max(float(softness), 0.001))
+
+    reach_x = (
+        max_half_length * _max_abs_cos_over_interval(base_angle, deviation)
+        + max_radial_reach
+    )
+    reach_y = (
+        max_half_length
+        * _max_abs_cos_over_interval(base_angle, deviation, math.pi * 0.5)
+        + max_radial_reach
+    )
+    return (
+        min(max(int(math.ceil(reach_x)), 1), 5),
+        min(max(int(math.ceil(reach_y)), 1), 5),
+    )
+
+
 def _segment_field(
     u: np.ndarray,
     v: np.ndarray,
@@ -869,6 +928,7 @@ def _segment_field(
     luminance_random: float,
     jitter: float,
     taper: float,
+    rounded_profile: bool = False,
 ) -> np.ndarray:
     cells_x, cells_y = _aspect_cells(scale, context)
     point_x = np.mod(u, 1.0) * np.float32(cells_x)
@@ -877,10 +937,18 @@ def _segment_field(
     base_y = np.floor(point_y).astype(np.int32)
     value = np.zeros_like(point_x, dtype=np.float32)
     base_angle = math.radians(angle_degrees)
-    density = min(max(int(density), 1), 3)
+    density = min(max(int(density), 1), 10)
     phase = float(TAU * evolution * cycles)
-    for oy in range(-1, 2):
-        for ox in range(-1, 2):
+    search_x, search_y = _segment_search_radii(
+        length=length,
+        width=width,
+        softness=softness,
+        angle_degrees=angle_degrees,
+        angle_random=angle_random,
+        rounded_profile=rounded_profile,
+    )
+    for oy in range(-search_y, search_y + 1):
+        for ox in range(-search_x, search_x + 1):
             neighbour_x = base_x + ox
             neighbour_y = base_y + oy
             wrapped_x = np.mod(neighbour_x, cells_x).astype(np.uint32)
@@ -915,7 +983,17 @@ def _segment_field(
                 edge = local_width * np.float32(max(softness, 0.001) * 1.5 + 0.05)
                 strand = np.float32(1.0) - _smoothstep(local_width - edge, local_width + edge, distance)
                 if taper > 0.0:
-                    endpoint = np.clip(np.float32(1.0) - np.abs(along) / np.maximum(half_length, np.float32(1e-5)), 0.0, 1.0)
+                    normalised_along = along / np.maximum(half_length, np.float32(1e-5))
+                    if rounded_profile:
+                        # Fur needs a rounded longitudinal height profile.  The
+                        # former 1-|x| triangle had a derivative discontinuity
+                        # at the strand midpoint, creating a visible crease.
+                        endpoint = np.clip(
+                            np.float32(1.0) - normalised_along * normalised_along,
+                            0.0, 1.0,
+                        )
+                    else:
+                        endpoint = np.clip(np.float32(1.0) - np.abs(normalised_along), 0.0, 1.0)
                     strand *= np.power(endpoint, np.float32(0.35 + taper * 1.65))
                 luminance = np.float32(1.0) - hv * np.float32(np.clip(luminance_random, 0.0, 1.0))
                 value = np.maximum(value, strand * luminance)
@@ -1109,6 +1187,7 @@ def eval_fur(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], conte
         width=float(params.get("width", 0.026)), softness=float(params.get("softness", 0.2)),
         angle_degrees=float(params.get("angle", -90.0)), angle_random=float(params.get("angle_random", 24.0)),
         luminance_random=float(params.get("luminance_random", 0.58)), jitter=1.0, taper=0.95,
+        rounded_profile=True,
     )
     undercoat = _segment_field(
         u, v, context, scale=scale * 0.62, seed=seed + 9511, evolution=evolution, cycles=cycles,
@@ -1116,6 +1195,7 @@ def eval_fur(_inputs: Mapping[str, ImageArray], params: Mapping[str, Any], conte
         width=float(params.get("width", 0.026)) * 1.5, softness=0.55,
         angle_degrees=float(params.get("angle", -90.0)), angle_random=float(params.get("angle_random", 24.0)) * 1.4,
         luminance_random=0.8, jitter=1.0, taper=0.8,
+        rounded_profile=True,
     )
     value = np.maximum(value, undercoat * np.float32(0.42))
     return _common_finish(value.astype(np.float32), params)
@@ -1214,10 +1294,12 @@ def _structured_parameters(kind: str) -> tuple[ParameterSpec, ...]:
         "messy": (18.0, 2, 1.45, 0.08, 0.32, 0.0, 105.0, 0.68),
         "fur": (24.0, 3, 0.85, 0.05, 0.22, -90.0, 24.0, 0.52),
     }[kind]
+    density_maximum = 10 if kind == "fur" else 3
+    length_maximum = 5.0 if kind == "fur" else 3.0
     common: tuple[ParameterSpec, ...] = (
         f("scale", "Scale", "float", defaults[0], 1.0, 128.0, 1.0, animatable=True),
-        f("density", "Density", "int", defaults[1], 1, 3, 1, animatable=True),
-        f("length", "Length", "float", defaults[2], 0.05, 3.0, 0.01, animatable=True),
+        f("density", "Density", "int", defaults[1], 1, density_maximum, 1, animatable=True),
+        f("length", "Length", "float", defaults[2], 0.05, length_maximum, 0.01, animatable=True),
         f("width", "Width", "float", defaults[3], 0.002, 0.4, 0.002, animatable=True),
         f("softness", "Softness", "float", defaults[4], 0.0, 1.0, 0.01, animatable=True),
         f("angle", "Angle", "float", defaults[5], -180.0, 180.0, 1.0, animatable=True, editor="angle", unit="degrees"),

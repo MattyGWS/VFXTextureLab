@@ -1025,7 +1025,7 @@ class GraphEvaluator:
         if requested_type in {
             "material.pbr", "material.blend", "material.override", "material.switch",
             "material.crop", "material.make_it_tile_photo",
-        }:
+        } or (requested_type == "geometry.bake_high_to_low" and requested_output == "Baked Material"):
             material_uid = node_uid
             material_channel = requested_output if requested_output in {
                 "Base Colour", "Emissive", "Normal", "Height", "Ambient Occlusion",
@@ -1313,6 +1313,8 @@ class GraphEvaluator:
                     input_signatures: list[tuple[str, str]] = []
                     upstream_dynamic = False
                     for input_name in node.input_names:
+                        if node.definition.type_id == "geometry.bake_high_to_low":
+                            continue
                         if node.definition.type_id == "material.channels" and input_name == "Material":
                             continue
                         source_ref = self._source_reference(snapshot.inputs.get((uid, input_name)))
@@ -1867,6 +1869,11 @@ class GraphEvaluator:
             stack.append((uid, True))
             node = snapshot.nodes[uid]
             dependencies: list[str] = []
+            # Completed bake outputs are persistent graph values. Ordinary image
+            # and Material consumers decode them directly and must not walk back
+            # into the high/low geometry or source texture branches.
+            if node.definition.type_id == "geometry.bake_high_to_low":
+                continue
             for input_name in node.input_names:
                 # Material Channels resolves its structural Material input on
                 # demand. Traversing it here would eagerly execute every PBR
@@ -2123,6 +2130,25 @@ class GraphEvaluator:
         transients: list[GpuImage],
         pending_gpu_cache: dict[str, GpuImage],
     ) -> tuple[ImageResource, str]:
+        if source_node.definition.type_id == "geometry.bake_high_to_low":
+            from ..geometry_bake import bake_output_image, BAKE_OUTPUT_KINDS
+            if output_name not in BAKE_OUTPUT_KINDS:
+                return source_resource, source_signature
+            image, data_kind, precision_name = bake_output_image(
+                source_node.parameters, output_name, context.width, context.height
+            )
+            logical_format = TextureFormat.R16F if data_kind == "grayscale" else TextureFormat.RGBA16F
+            signature = hashlib.sha256(
+                f"{source_signature}:bake-output:{output_name}".encode()
+            ).hexdigest()
+            resource = CpuImage(
+                np.ascontiguousarray(image, dtype=np.float32), logical_format, signature,
+                frozenset({"cpu", "persistent-bake"}), data_kind, precision_name,
+            )
+            self.cpu_cache.put(signature, resource)
+            stats["cpu"] += 1
+            return resource, signature
+
         if source_node.definition.type_id == "material.channels":
             if output_name == "Base Colour":
                 return source_resource, source_signature
@@ -2264,11 +2290,76 @@ class GraphEvaluator:
             image_inputs[input_name] = resource
         return image_inputs, effective_parameters
 
+    @staticmethod
+    def _output_revision_parameters(node: SnapshotNode) -> dict[str, Any]:
+        """Return only parameters that alter the node's currently published output.
+
+        Manual-action nodes intentionally keep their previous successful result
+        while artists adjust the next run's settings. Those unapplied settings,
+        progress/status fields and request serials must therefore not invalidate
+        downstream caches. Publishing a new ``_manual_result_data`` payload is
+        the transaction that advances the authored output revision.
+        """
+        diagnostic_prefixes = (
+            "_geometry_", "_uv_", "_bake_", "_output_", "_decimation_", "_source_",
+        )
+        if not node.definition.manual_action_label:
+            return {
+                str(key): value
+                for key, value in node.parameters.items()
+                if not str(key).startswith(diagnostic_prefixes)
+            }
+        relevant = set(node.definition.manual_action_relevant_parameters)
+        cleaned = {
+            str(key): value
+            for key, value in node.parameters.items()
+            if not str(key).startswith(("_manual_", *diagnostic_prefixes))
+            and str(key) not in relevant
+        }
+        if node.definition.type_id == "geometry.bake_high_to_low":
+            cleaned.pop("preview_output", None)
+        result_data = node.parameters.get("_manual_result_data")
+        if result_data:
+            # Persistent manual results can be several megabytes. Serialising
+            # that base64 payload into every branch-revision calculation made a
+            # cheap Inspector toggle briefly block the UI. The worker publishes
+            # a compact content digest alongside each result; older 0.52 graphs
+            # fall back to their deterministic source/settings signature.
+            result_revision = (
+                node.parameters.get("_manual_result_revision")
+                or node.parameters.get("_manual_signature")
+                or f"completed:{int(node.parameters.get('_manual_completed_serial', 0) or 0)}"
+            )
+            cleaned["_manual_result_revision"] = str(result_revision)
+        return cleaned
+
+    def _content_revision_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
+        """Disconnect dependencies that do not alter currently published output."""
+        filtered_inputs: dict[tuple[str, str], tuple[str, str]] = {}
+        for key, source in snapshot.inputs.items():
+            target_uid, input_name = str(key[0]), str(key[1])
+            node = snapshot.nodes.get(target_uid)
+            if node is None:
+                filtered_inputs[key] = source
+                continue
+            if input_name in node.definition.presentation_only_inputs:
+                continue
+            # A completed manual node is a persistent transactional result. Its
+            # source geometry/settings may become stale, but its output remains
+            # byte-for-byte unchanged until the user explicitly runs it again.
+            if node.definition.manual_action_label and node.parameters.get("_manual_result_data"):
+                continue
+            filtered_inputs[key] = source
+        if len(filtered_inputs) == len(snapshot.inputs):
+            return snapshot
+        return GraphSnapshot(snapshot.nodes, filtered_inputs)
+
     def _simulation_revision(self, snapshot: GraphSnapshot, node_uid: str) -> str:
-        order = self._execution_order(snapshot, node_uid, lambda: False)
+        content_snapshot = self._content_revision_snapshot(snapshot)
+        order = self._execution_order(content_snapshot, node_uid, lambda: False)
         payload_nodes: list[dict[str, Any]] = []
         for uid in order:
-            node = snapshot.nodes[uid]
+            node = content_snapshot.nodes[uid]
             source_revision: Any = None
             if node.definition.type_id == "input.image" and not node.parameters.get("_embedded_data"):
                 try:
@@ -2281,11 +2372,12 @@ class GraphEvaluator:
                     "uid": uid,
                     "type": node.definition.type_id,
                     "package_revision": node.definition.package.revision if node.definition.package else None,
-                    "parameters": node.parameters,
+                    "parameters": self._output_revision_parameters(node),
                     "source_revision": source_revision,
                     "inputs": [
-                        (name, self._source_reference(snapshot.inputs.get((uid, name))))
+                        (name, self._source_reference(content_snapshot.inputs.get((uid, name))))
                         for name in node.input_names
+                        if name not in node.definition.presentation_only_inputs
                     ],
                 }
             )
@@ -2419,6 +2511,18 @@ class GraphEvaluator:
         cancel_check: Callable[[], bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> tuple[ImageResource, str]:
+        if node.definition.type_id == "geometry.bake_high_to_low":
+            from ..geometry_bake import bake_output_image
+            image, data_kind, precision_name = bake_output_image(
+                node.parameters, "Albedo", context.width, context.height
+            )
+            resource = CpuImage(
+                np.ascontiguousarray(image, dtype=np.float32), TextureFormat.RGBA16F, signature,
+                frozenset({"cpu", "persistent-bake"}), data_kind, precision_name,
+            )
+            stats["cpu"] += 1
+            self.cpu_cache.put(signature, resource)
+            return resource, signature
         if node.definition.type_id == "convert.extract_channel" and ":" not in node.uid and "Image" in input_resources:
             return input_resources["Image"], signature
         logical_format, output_precision, data_kind = self._output_spec_for(node, input_resources, context)

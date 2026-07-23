@@ -2,6 +2,19 @@
 
 Version 0.46.2 introduced a coherent preparation path for photographs, scanned surfaces, sprite atlases and multi-channel scanned materials. Version 0.46.2.1 replaced the first Make It Tile reconstruction with warped photographic cut masks and added direct manipulation in the 2D Preview. Version 0.46.2.2 corrects Perspective Transform to destination-space editing and adds independent X/Y stretching to Transform 2D.
 
+Version 0.52.1 adds the first geometry-side scan cleanup workflow:
+
+```text
+Mesh Input
+→ Geometry Delete Small Parts
+→ Geometry Remesh
+→ Geometry Decimate
+→ Geometry Normals
+→ Geometry UV Unwrap
+```
+
+**Geometry Delete Small Parts** replaces the common manual process of selecting the dominant connected scan object, inverting the selection and deleting floating debris. **Geometry Remesh** is a prompted/manual voxel operation: configure its resolution, press Remesh, and keep using the previous completed result while preparing another run. It creates fresh topology and therefore deliberately removes source UVs; place Geometry UV Unwrap later in the branch.
+
 A typical image workflow is:
 
 ```text

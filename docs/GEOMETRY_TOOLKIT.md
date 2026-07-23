@@ -2,6 +2,14 @@
 
 Version 0.49.0 turns the Geometry data type from a small set of generators into a reusable procedural mesh workflow.
 
+## Geometry Delete Small Parts
+
+Geometry Delete Small Parts automates the usual scan-cleanup operation of keeping the dominant connected object and deleting floating debris. Connectivity is calculated on welded geometric positions so UV seams and hard-normal duplicates do not fragment one surface. **Keep Largest Only** retains the dominant part; **Keep Parts Above Relative Size** can retain meaningful secondary pieces according to geometric vertex count, triangle count or surface area.
+
+## Geometry Remesh
+
+Geometry Remesh rebuilds the source through a voxel volume and is deliberately manual: edit the resolution and surface settings, then press **Remesh** in the Inspector. Relative voxel size adapts to arbitrary imported units; Absolute Units gives object-space control. Interior fill, smoothing, volume preservation and adaptivity cover the central Blender-style voxel-remesh workflow. The previous successful result stays live while settings are Out of Date. New topology receives smooth normals and no UVs.
+
 ## Geometry Transform
 
 Geometry Transform accepts any Geometry value and applies scale, X/Y/Z rotation, then translation. **Current Origin** uses the exported pivot at world zero. **Bounds Centre** transforms around the current mesh centre while leaving the output export pivot unchanged. Non-uniform scale transforms normals with the inverse scale, and an odd number of mirrored axes reverses triangle winding automatically.
@@ -9,6 +17,14 @@ Geometry Transform accepts any Geometry value and applies scale, X/Y/Z rotation,
 ## Geometry Subdivide
 
 Every level splits one triangle into four and shares midpoint vertices across indexed edges. **Smooth Surface** off preserves positions, normals, UVs and the original silhouette while increasing topology density. This is the preferred mode before Geometry Displace. Smooth Surface on performs a welded-position relaxation and rebuilds smooth normals. A safety limit rejects requests that would exceed two million output triangles.
+
+## Geometry Decimate
+
+Geometry Decimate uses the compiled fast-simplification quadric-error backend to reduce the mesh toward a **Percentage** of its input triangle count. The control is a floating-point percentage from 1% to 100%, with 100% returning an unchanged copy. UV and hard-normal seam copies are temporarily welded into geometric topology, then restored at coincident output positions. Closed inputs use iterative watertight re-planning when one collapse ordering would create cracks, allowing one node to reach reductions that previously required a chain of Decimate nodes.
+
+## Geometry Un-Subdivide
+
+Un-Subdivide is deliberately iteration-based rather than percentage-based. Subdivision creates discrete topology levels, so one iteration removes one compatible midpoint-subdivision level and changes each four-triangle patch back into its earlier triangle. It exactly recognises the stable topology emitted by Geometry Subdivide, including after Smooth Surface or later position-only deformation, and performs a topology-based fallback for compatible imported meshes. Arbitrary triangulation does not preserve enough history to guarantee reconstruction, so incompatible meshes report a clear node error instead of guessing.
 
 ## Geometry Normals
 

@@ -144,7 +144,7 @@ def main() -> None:
         assert renderer.settings["invert_height"] is True
 
     saved = window._project_data()
-    assert saved["version"] == 18
+    assert saved["version"] == 20
     assert saved["viewport_3d"]["settings"]["displacement_amount"] == 0.83
     saved_material = next(node for node in saved["nodes"] if node["type"] == "material.pbr")
     assert MOVED.isdisjoint(saved_material["parameters"])

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, copy_metadata
 
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parents[1]
@@ -32,8 +32,18 @@ datas = [
     (str(PROJECT_ROOT / "LICENSE"), "."),
     (str(PROJECT_ROOT / "README.md"), "."),
     (str(PROJECT_ROOT / "CHANGELOG.md"), "."),
+    (str(PROJECT_ROOT / "THIRD_PARTY_NOTICES.md"), "."),
 ]
 datas += copy_metadata("vfx-texture-lab")
+datas += copy_metadata("embreex")
+datas += copy_metadata("trimesh")
+
+# Native QEM simplification ships as a platform extension. Collecting its
+# package submodules and dynamic libraries explicitly keeps the Windows build
+# independent of PyInstaller hook coverage for this smaller dependency.
+fast_simplification_binaries = collect_dynamic_libs("fast_simplification")
+xatlas_binaries = collect_dynamic_libs("xatlas")
+embreex_binaries = collect_dynamic_libs("embreex")
 
 # wgpu 0.31 supplies its own PyInstaller hook, which collects resources, native
 # libraries, and the default backend. The explicit backend imports below are a
@@ -44,13 +54,26 @@ hiddenimports = [
     "wgpu.backends.auto",
     "wgpu.backends.wgpu_native",
 ]
+hiddenimports += collect_submodules("fast_simplification")
+hiddenimports += collect_submodules("xatlas")
+hiddenimports += collect_submodules("embreex")
+# Geometry Remesh imports these packages lazily so ordinary texture-only startup
+# remains light. Include their dynamic modules explicitly in frozen builds.
+hiddenimports += collect_submodules("trimesh")
+hiddenimports += collect_submodules("skimage.measure")
+hiddenimports += [
+    "scipy.ndimage",
+    "scipy.sparse",
+    "scipy.sparse.csgraph",
+    "skimage.measure",
+]
 
 block_cipher = None
 
 a = Analysis(
     [str(PROJECT_ROOT / "packaging" / "windows" / "launcher.py")],
     pathex=[str(PROJECT_ROOT)],
-    binaries=[],
+    binaries=fast_simplification_binaries + xatlas_binaries + embreex_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -157,6 +157,33 @@ def command_verify(args: argparse.Namespace) -> int:
     if not wgpu_dlls:
         failures.append("No wgpu-native DLL was found in the frozen build.")
 
+    native_simplification_files = [
+        path for path in all_files
+        if path.suffix.lower() in {".pyd", ".dll"}
+        and (
+            "fast_simplification" in path.as_posix().lower()
+            or "simplif" in path.name.lower()
+        )
+    ]
+    if not native_simplification_files:
+        failures.append("No fast-simplification native extension was found in the frozen build.")
+
+    native_xatlas_files = [
+        path for path in all_files
+        if path.suffix.lower() in {".pyd", ".dll"}
+        and "xatlas" in path.as_posix().lower()
+    ]
+    if not native_xatlas_files:
+        failures.append("No xatlas native extension was found in the frozen build.")
+
+    native_embreex_files = [
+        path for path in all_files
+        if path.suffix.lower() in {".pyd", ".dll"}
+        and ("embreex" in path.as_posix().lower() or "embree" in path.name.lower())
+    ]
+    if not native_embreex_files:
+        failures.append("No embreex/Embree native library was found in the frozen build.")
+
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)

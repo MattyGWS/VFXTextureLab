@@ -194,7 +194,7 @@ fn cell_spots(
                 noise_wrap_i(neighbour.x, i32(cells.x)),
                 noise_wrap_i(neighbour.y, i32(cells.y)),
             );
-            for (var point_index: u32 = 0u; point_index < 3u; point_index = point_index + 1u) {
+            for (var point_index: u32 = 0u; point_index < 10u; point_index = point_index + 1u) {
                 if (point_index >= points_per_cell) { break; }
                 let cell3 = vec3<u32>(wrapped, point_index);
                 let hx = noise_hash31(cell3, seed, 13u);
@@ -241,7 +241,7 @@ fn sparse_spot_field(
                 noise_wrap_i(neighbour.x, i32(cells.x)),
                 noise_wrap_i(neighbour.y, i32(cells.y)),
             );
-            for (var point_index: u32 = 0u; point_index < 3u; point_index = point_index + 1u) {
+            for (var point_index: u32 = 0u; point_index < 10u; point_index = point_index + 1u) {
                 if (point_index >= points_per_cell) { break; }
                 let cell3 = vec3<u32>(wrapped, point_index);
                 let hx = noise_hash31(cell3, seed, 101u);
@@ -452,7 +452,41 @@ struct SegmentArgs {
     luminance_random: f32,
     jitter: f32,
     taper: f32,
+    rounded_profile: u32,
 };
+
+fn segment_max_abs_cos_interval(center: f32, half_span: f32, phase: f32) -> f32 {
+    let start = center - half_span - phase;
+    let end = center + half_span - phase;
+    let pi = 0.5 * NOISE_TAU;
+    let first_peak = ceil(start / pi);
+    let last_peak = floor(end / pi);
+    if (first_peak <= last_peak) {
+        return 1.0;
+    }
+    return max(abs(cos(start)), abs(cos(end)));
+}
+
+fn segment_search_radius(args: SegmentArgs) -> vec2<i32> {
+    if (args.rounded_profile == 0u) {
+        return vec2<i32>(1, 1);
+    }
+    let base_angle = radians(args.angle_degrees);
+    // The random term spans +/- 0.5 of Angle Random and animated sway adds
+    // another +/- 0.08, so 0.58 is the exact conservative half-span.
+    let deviation = radians(abs(args.angle_random)) * 0.58;
+    let max_half_length = max(args.length_value, 0.02) * 1.35 * 0.5;
+    let max_local_width = max(args.width_value, 0.002) * 1.3;
+    let max_radial_reach = max_local_width * (1.05 + 1.5 * max(args.softness, 0.001));
+    let reach_x = max_half_length * segment_max_abs_cos_interval(base_angle, deviation, 0.0)
+        + max_radial_reach;
+    let reach_y = max_half_length * segment_max_abs_cos_interval(base_angle, deviation, 0.25 * NOISE_TAU)
+        + max_radial_reach;
+    return vec2<i32>(
+        clamp(i32(ceil(reach_x)), 1, 5),
+        clamp(i32(ceil(reach_y)), 1, 5),
+    );
+}
 
 fn segment_field(
     uv: vec2<f32>, width: f32, height: f32, scale: f32, seed: u32,
@@ -461,18 +495,21 @@ fn segment_field(
     let cells = noise_aspect_cells(scale, width, height);
     let point = fract(uv) * vec2<f32>(cells);
     let base = vec2<i32>(floor(point));
-    let density = clamp(args.density, 1u, 3u);
+    let density = clamp(args.density, 1u, 10u);
     let base_angle = radians(args.angle_degrees);
     let phase = NOISE_TAU * evolution * cycles;
+    let search_radius = segment_search_radius(args);
     var value = 0.0;
-    for (var oy: i32 = -1; oy <= 1; oy = oy + 1) {
-        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
+    for (var oy: i32 = -5; oy <= 5; oy = oy + 1) {
+        if (abs(oy) > search_radius.y) { continue; }
+        for (var ox: i32 = -5; ox <= 5; ox = ox + 1) {
+            if (abs(ox) > search_radius.x) { continue; }
             let neighbour = base + vec2<i32>(ox, oy);
             let wrapped = vec2<u32>(
                 noise_wrap_i(neighbour.x, i32(cells.x)),
                 noise_wrap_i(neighbour.y, i32(cells.y)),
             );
-            for (var point_index: u32 = 0u; point_index < 3u; point_index = point_index + 1u) {
+            for (var point_index: u32 = 0u; point_index < 10u; point_index = point_index + 1u) {
                 if (point_index >= density) { break; }
                 let cell3 = vec3<u32>(wrapped, point_index);
                 let hx = noise_hash31(cell3, seed, 41u);
@@ -496,7 +533,13 @@ fn segment_field(
                 let edge = local_width * (max(args.softness, 0.001) * 1.5 + 0.05);
                 var strand = 1.0 - smooth_range(local_width - edge, local_width + edge, distance);
                 if (args.taper > 0.0) {
-                    let endpoint = clamp(1.0 - abs(along) / max(half_length, 0.00001), 0.0, 1.0);
+                    let normalised_along = along / max(half_length, 0.00001);
+                    var endpoint = clamp(1.0 - abs(normalised_along), 0.0, 1.0);
+                    if (args.rounded_profile != 0u) {
+                        // A parabolic dome removes the midpoint cusp produced
+                        // by the mirrored linear profile used by other fibres.
+                        endpoint = clamp(1.0 - normalised_along * normalised_along, 0.0, 1.0);
+                    }
                     strand = strand * pow(endpoint, 0.35 + args.taper * 1.65);
                 }
                 let luminance = 1.0 - hv * clamp(args.luminance_random, 0.0, 1.0);
@@ -696,14 +739,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var taper = 0.35;
         if (variant == 11u) { taper = 0.55; }
         if (variant == 13u) { taper = 0.95; }
-        let args = SegmentArgs(u32(round(params.p3.y)), params.p3.z, params.p3.w, params.p4.x, params.p4.y, params.p4.z, params.p4.w, 1.0, taper);
+        let rounded_profile = select(0u, 1u, variant == 13u);
+        let args = SegmentArgs(u32(round(params.p3.y)), params.p3.z, params.p3.w, params.p4.x, params.p4.y, params.p4.z, params.p4.w, 1.0, taper, rounded_profile);
         value = segment_field(working_uv, width, height, scale, seed, evolution, cycles, args);
         if (variant == 11u) {
             let breakup = fractal_field(working_uv, width, height, scale * 1.8, 3u, 0.55, seed + 6343u, evolution, cycles, 0u, 2.0);
             let breakage = clamp(params.p6.z, 0.0, 1.0);
             value = value * clamp(1.0 - breakage * (1.0 - breakup) * 1.35, 0.0, 1.0);
         } else if (variant == 13u) {
-            let under_args = SegmentArgs(2u, params.p3.z * 0.72, params.p3.w * 1.5, 0.55, params.p4.y, params.p4.z * 1.4, 0.8, 1.0, 0.8);
+            let under_args = SegmentArgs(2u, params.p3.z * 0.72, params.p3.w * 1.5, 0.55, params.p4.y, params.p4.z * 1.4, 0.8, 1.0, 0.8, 1u);
             let undercoat = segment_field(working_uv, width, height, scale * 0.62, seed + 9511u, evolution, cycles, under_args);
             value = max(value, undercoat * 0.42);
         }

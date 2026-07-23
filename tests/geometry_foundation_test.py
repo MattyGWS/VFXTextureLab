@@ -62,6 +62,10 @@ def test_geometry_foundation(tmp_path: Path) -> None:
     assert result.geometry is not None
     assert result.geometry.vertex_count == 15
     assert result.geometry.triangle_count == 16
+    assert result.node_metadata["plane"]["_geometry_output_vertex_count"] == 15
+    assert result.node_metadata["plane"]["_geometry_output_triangle_count"] == 16
+    assert result.node_metadata["output"]["_geometry_input_triangle_count"] == 16
+    assert result.node_metadata["output"]["_geometry_output_triangle_count"] == 16
     assert np.allclose(result.geometry.vertices[:, 6:8].min(axis=0), (0.0, 0.0))
     assert np.allclose(result.geometry.vertices[:, 6:8].max(axis=0), (1.0, 1.0))
     assert np.allclose(result.geometry.vertices[:, 3:6], (0.0, 1.0, 0.0))
