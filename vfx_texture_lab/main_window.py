@@ -9264,7 +9264,7 @@ class MainWindow(QMainWindow):
             "About VFX Texture Lab",
             f"<b>VFX Texture Lab {__version__}</b><br><br>"
             "A focused, open-source procedural texture graph for VFX artists.<br><br>"
-            "0.53.0.3 corrects tangent-axis orientation on mirrored UV charts so baked normal maps, the 3D Preview and Height to Normal use one consistent convention.",
+            "0.53.0.4 fixes intermittent graph-canvas wheel zoom lockups after opening or framing unusually large graphs.",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:

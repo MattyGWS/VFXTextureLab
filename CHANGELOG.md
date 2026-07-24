@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.53.0.4 — Graph Canvas Wheel-Zoom Recovery
+
+- Fixed an intermittent graph-canvas lockup where the mouse wheel did nothing immediately after opening a large or widely spaced graph. `fitInView` could legitimately frame the graph below the ordinary 0.18× interactive minimum, but the old wheel handler rejected every wheel-in step that had not crossed the minimum in a single tick, leaving the transform trapped until **F** framed a selected node.
+- Wheel bounds are now directional: zoom-in is always allowed from below the minimum, zoom-out is always allowed from above the maximum, and only movement farther beyond a boundary is blocked. This preserves whole-graph framing while guaranteeing a path back into the normal interactive range.
+- Added pixel-delta support for high-resolution touchpads, stopped zero-delta events from being interpreted as zoom-out, and added a finite-transform recovery guard.
+- Added an offscreen regression test covering below-minimum and above-maximum recovery, boundary behaviour, pixel-only scrolling, empty events and degenerate transforms.
+- This is a source-only correction. Existing 0.53.0 users do not need to rerun setup. Graph format remains **20** and the built-in registry remains at **187 node types**.
+
 ## 0.53.0.3 — Mirrored UV Tangent-Space Consistency
 
 - Fixed tangent-space normal bakes appearing to need a manual Red/X inversion on mirrored xatlas or imported UV islands. The tangent formula had normalised its numerator without retaining the UV determinant sign, so +U and +V silently pointed backwards on mirrored charts.
@@ -1297,6 +1305,14 @@
 - Accurate linear-frequency histogram rendering from 0.18.8 remains the shared display model across histogram-driven editors.
 
 # Changelog
+
+## 0.53.0.4 — Graph Canvas Wheel-Zoom Recovery
+
+- Fixed an intermittent graph-canvas lockup where the mouse wheel did nothing immediately after opening a large or widely spaced graph. `fitInView` could legitimately frame the graph below the ordinary 0.18× interactive minimum, but the old wheel handler rejected every wheel-in step that had not crossed the minimum in a single tick, leaving the transform trapped until **F** framed a selected node.
+- Wheel bounds are now directional: zoom-in is always allowed from below the minimum, zoom-out is always allowed from above the maximum, and only movement farther beyond a boundary is blocked. This preserves whole-graph framing while guaranteeing a path back into the normal interactive range.
+- Added pixel-delta support for high-resolution touchpads, stopped zero-delta events from being interpreted as zoom-out, and added a finite-transform recovery guard.
+- Added an offscreen regression test covering below-minimum and above-maximum recovery, boundary behaviour, pixel-only scrolling, empty events and degenerate transforms.
+- This is a source-only correction. Existing 0.53.0 users do not need to rerun setup. Graph format remains **20** and the built-in registry remains at **187 node types**.
 
 ## Unreleased — Automated Windows Distribution
 

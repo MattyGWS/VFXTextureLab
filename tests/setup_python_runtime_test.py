@@ -16,7 +16,7 @@ def test_project_requires_wheel_compatible_python_and_binary_xatlas() -> None:
     setup_bat = (ROOT / "setup.bat").read_text(encoding="utf-8")
 
     assert 'requires-python = ">=3.11,<3.14"' in pyproject
-    assert 'version = "0.53.0.3"' in pyproject
+    assert 'version = "0.53.0.4"' in pyproject
     assert '"$UV_BIN" python install 3.13' in setup_sh
     assert '"$UV_BIN" venv --clear --seed --python 3.13 "$VENV_DIR"' in setup_sh
     assert "--only-binary=xatlas,embreex,scipy,scikit-image" in setup_sh

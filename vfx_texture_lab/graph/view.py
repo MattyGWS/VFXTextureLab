@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QMimeData, QPoint, QPointF, QRectF, QTimer, Qt, Signal, QUrl
@@ -36,6 +37,9 @@ class GraphView(QGraphicsView):
     PORT_DRAG_START_MIN_PX = 14.0
     LOOSE_CONNECTION_SEARCH_MIN_DISTANCE_PX = 48.0
     NODE_GRID_SIZE = 24.0
+    MIN_ZOOM_SCALE = 0.18
+    MAX_ZOOM_SCALE = 3.5
+    WHEEL_ZOOM_FACTOR = 1.15
 
     def __init__(self, scene: GraphScene, preferences: NodePreferences, parent=None) -> None:
         super().__init__(scene, parent)
@@ -168,11 +172,42 @@ class GraphView(QGraphicsView):
         self.viewportChanged.emit()
 
     def wheelEvent(self, event) -> None:
-        factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
-        current = self.transform().m11()
-        next_scale = current * factor
-        if 0.18 <= next_scale <= 3.5:
-            self.scale(factor, factor)
+        delta = int(event.angleDelta().y())
+        if delta == 0:
+            # Some high-resolution touchpads report only pixel deltas. A
+            # zero-delta wheel event must not be mistaken for zoom-out.
+            delta = int(event.pixelDelta().y())
+        if delta == 0:
+            event.ignore()
+            return
+
+        current = abs(float(self.transform().m11()))
+        if not math.isfinite(current) or current <= 1.0e-9:
+            # A malformed/degenerate transform should never leave navigation
+            # permanently unusable. Reset to a valid basis before zooming.
+            self.resetTransform()
+            current = 1.0
+
+        if delta > 0:
+            # fitInView is intentionally allowed to frame very large graphs at
+            # less than MIN_ZOOM_SCALE. Always permit wheel-in from that state
+            # so the view can recover instead of becoming trapped below the
+            # normal interactive zoom range.
+            if current >= self.MAX_ZOOM_SCALE:
+                event.accept()
+                return
+            target = min(current * self.WHEEL_ZOOM_FACTOR, self.MAX_ZOOM_SCALE)
+        else:
+            # Likewise, permit wheel-out from a scale above the normal maximum.
+            # Only block movement that would travel farther beyond a boundary.
+            if current <= self.MIN_ZOOM_SCALE:
+                event.accept()
+                return
+            target = max(current / self.WHEEL_ZOOM_FACTOR, self.MIN_ZOOM_SCALE)
+
+        applied_factor = target / current
+        if math.isfinite(applied_factor) and applied_factor > 0.0:
+            self.scale(applied_factor, applied_factor)
             self.viewportChanged.emit()
         event.accept()
 
